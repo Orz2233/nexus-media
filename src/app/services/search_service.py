@@ -47,6 +47,17 @@ class SearchQueryBuilder:
         根据媒体信息构建多语言搜索词列表
         :return: (搜索词列表, 建议最大并发数)
         """
+        # 自定义内容画像（如 AV）只用番号/关键词搜索，避免标题带来噪声
+        profile = str(getattr(media_info, "content_profile", "") or "").strip()
+        if profile and profile != "default":
+            keyword = (
+                media_info.keyword
+                or getattr(media_info, "anchor_external_id", "")
+                or str(getattr(media_info, "tmdb_id", "") or "").split(":", 1)[-1]
+            )
+            if keyword:
+                return [str(keyword)], 1
+
         search_name_list = []
         if media_info.keyword:
             search_name_list.append(media_info.keyword)
@@ -240,7 +251,19 @@ class SearchResultProcessor:
         """过滤掉已完成下载历史中存在的资源（失败/进行中的任务不阻塞）"""
         filtered = []
         for media_item in media_list:
-            if media_item.tmdb_id:
+            ref = media_item.get_media_ref()
+            if ref is not None and ref.provider != "tmdb":
+                season_episode = media_item.get_season_episode_string()
+                is_done = getattr(self._download_repo, "is_completed_by_identity", None)
+                if is_done and is_done(
+                    identity_id=getattr(media_item, "identity_id", None),
+                    anchor_provider=ref.provider,
+                    anchor_external_id=ref.external_id,
+                    season_episode=season_episode,
+                ):
+                    log.info(f"[Searcher]{media_item.title} {season_episode} 已存在完成下载，跳过下载")
+                    continue
+            elif media_item.tmdb_id:
                 season_episode = media_item.get_season_episode_string()
                 if self._download_repo.is_completed_by_tmdb(media_item.tmdb_id, season_episode):
                     log.info(f"[Searcher]{media_item.title} {season_episode} 已存在完成下载，跳过下载")

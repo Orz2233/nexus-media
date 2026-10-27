@@ -59,6 +59,7 @@ from app.infrastructure.temp import temp_manager
 from app.mediaserver.registry import get_all_clients as get_all_mediaservers
 from app.message.registry import get_all_clients
 from app.message.switches import MESSAGE_SWITCHES
+from app.message.template_registry import message_template_registry
 from app.message.templates import DEFAULT_MESSAGE_TEMPLATES
 from app.schemas.auth import UserContext
 from app.schemas.common import CommonResponse
@@ -325,6 +326,18 @@ def get_message_client_default_templates(
     return success(data=DEFAULT_MESSAGE_TEMPLATES)
 
 
+@router.get(
+    "/message_clients/templates/profiles",
+    response_model=CommonResponse,
+    summary="获取插件内容画像消息模板",
+)
+def get_message_client_profile_templates(
+    current_user: UserContext = Depends(require_permission("setting:update")),
+):
+    """获取插件注入的画像模板；客户端可用 profile:msg_type 覆盖."""
+    return success(data={"profiles": message_template_registry.list_profiles()})
+
+
 @router.post("/net_test", response_model=CommonResponse, summary="网络连通性测试")
 def net_test(
     req: NetTestRequest,
@@ -535,6 +548,30 @@ def save_mediaserver_config(
     return fail(msg=result.msg)
 
 
+@router.post("/mediaservers/delete", response_model=CommonResponse, summary="删除媒体服务器实例")
+def delete_mediaserver(
+    req: dict,
+    current_user: UserContext = Depends(require_permission("setting:update")),
+    svc=Depends(get_media_server_config_service),
+):
+    result = svc.delete_config(int(req.get("id") or 0))
+    if result.success:
+        return success()
+    return fail(msg=result.msg)
+
+
+@router.post("/mediaservers/default", response_model=CommonResponse, summary="设置默认媒体服务器")
+def set_default_mediaserver(
+    req: dict,
+    current_user: UserContext = Depends(require_permission("setting:update")),
+    svc=Depends(get_media_server_config_service),
+):
+    result = svc.set_default(int(req.get("id") or 0))
+    if result.success:
+        return success()
+    return fail(msg=result.msg)
+
+
 @router.post("/scheduler/run", response_model=CommonResponse, summary="运行定时任务")
 def sch(
     req: SchedulerRequest,
@@ -687,6 +724,13 @@ def _strip_masked(value):
     return value
 
 
+def _config_for_user(flat: dict, user: UserContext) -> dict:
+    """按权限返回配置：只读用户脱敏，可修改配置的用户回显真实密钥。"""
+    if user.is_superadmin or user.has_permission("setting:update"):
+        return flat
+    return _mask_sensitive(flat)
+
+
 @router.post("/config", response_model=CommonResponse, summary="设置系统配置")
 def set_system_config(
     req: SystemConfigRequest,
@@ -713,7 +757,7 @@ def get_all_config(
     http_proxy = proxies.get("http") if isinstance(proxies, dict) else None
     if http_proxy:
         flat["app.proxies"] = http_proxy.removeprefix("http://")
-    return success(data=_mask_sensitive(flat))
+    return success(data=_config_for_user(flat, current_user))
 
 
 @router.post("/config/scraper", response_model=CommonResponse, summary="获取刮削配置")
@@ -779,7 +823,7 @@ def list_agent_models(
 ):
     """查询 LLM Provider 支持的模型列表"""
 
-    if not req.api_url or not req.api_key:
+    if not req.api_url or (req.provider_name != "ollama" and not req.api_key):
         return success(data=[])
 
     try:
@@ -790,7 +834,7 @@ def list_agent_models(
     config = ProviderConfig(
         name=req.provider_name,
         api_url=req.api_url,
-        api_key=req.api_key,
+        api_key=req.api_key or "",
         model="",
     )
 

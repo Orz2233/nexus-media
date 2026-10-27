@@ -39,6 +39,9 @@ from app.infrastructure.queue.memory_queue import MemoryMessageQueue
 from app.infrastructure.thread import ThreadExecutor
 from app.media import MediaService
 from app.media import meta_info as meta_info_fn
+from app.media.metadata.parsing import ParserChain
+from app.media.metadata.refs import parse_media_ref
+from app.media.metadata.registry import registry as metadata_registry
 from app.media.parser import RegexParser
 from app.message import Message
 from app.schemas.media import TransferMediaDTO
@@ -92,6 +95,7 @@ class FileTransferService:
         cleanup_service: TransferCleanupService,
         download_repo=None,
         subscribe_repo=None,
+        metadata_service=None,
     ):
         self.media = media_service
         self.message = message
@@ -113,6 +117,7 @@ class FileTransferService:
         self._download_repo = download_repo or DownloadHistoryRepositoryAdapter()
         self._subscribe_repo = subscribe_repo or SubscribeRepository()
         self._cleanup = cleanup_service
+        self._metadata_service = metadata_service
 
         # 从配置读取媒体处理参数
         media = settings.get("media")
@@ -153,12 +158,18 @@ class FileTransferService:
             return None
         try:
             tmdb_id = str(getattr(media, "tmdb_id", "") or "")
-            if not tmdb_id:
-                return None
-            if getattr(media, "type", None) == MediaType.MOVIE:
-                return self._subscribe_repo.find_movie_owner_user_id(tmdb_id)
-            season = media.get_season_string() if hasattr(media, "get_season_string") else None
-            return self._subscribe_repo.find_tv_owner_user_id(tmdb_id, season)
+            if tmdb_id:
+                if getattr(media, "type", None) == MediaType.MOVIE:
+                    return self._subscribe_repo.find_movie_owner_user_id(tmdb_id)
+                season = media.get_season_string() if hasattr(media, "get_season_string") else None
+                return self._subscribe_repo.find_tv_owner_user_id(tmdb_id, season)
+            provider = str(getattr(media, "anchor_provider", "") or "")
+            external = str(getattr(media, "anchor_external_id", "") or "")
+            if provider and external:
+                return self._subscribe_repo.find_owner_by_anchor(
+                    provider, external, getattr(media, "type", None) or MediaType.MOVIE
+                )
+            return None
         except Exception:  # noqa: BLE001
             log.debug("[FileTransfer]按订阅解析归属失败")
             return None
@@ -219,6 +230,9 @@ class FileTransferService:
 
     def get_transfer_info_by(self, tmdbid, season=None, season_episode=None):
         return self._history.get_transfer_info_by(tmdbid, season, season_episode)
+
+    def get_transfer_info_by_path(self, dest_path, filename=None):
+        return self._history.get_transfer_info_by_path(dest_path, filename)
 
     def get_transfer_info_by_id(self, logid):
         return self._history.get_transfer_info_by_id(logid)
@@ -343,7 +357,7 @@ class FileTransferService:
         files=None,
         target_dir=None,
         unknown_dir=None,
-        tmdb_info=None,
+        provider_data=None,
         media_type=None,
         season=None,
         episode=None,
@@ -402,14 +416,82 @@ class FileTransferService:
             # ---------- 阶段 3：查下载记录 + 批量识别 ----------
             dl_season = None
             dl_episode = None
-            if not tmdb_info:
-                tmdb_info, media_type, dl_season, dl_episode = self._lookup_download_record(in_path)
+            if not provider_data:
+                provider_data, media_type, dl_season, dl_episode = self._lookup_download_record(in_path)
 
-            medias = self.media.get_media_info_on_files(
-                file_list, tmdb_info, media_type, season, episode[0], backend=src_backend
-            )
+            # 先用插件 ParserProfile 短路识别，避免已识别文件再走一次 TMDB。
+            policy = str((settings.get("media") or {}).get("metadata_default_policy") or "tmdb_primary")
+            parser_chain = ParserChain()
+            profile_medias = {}
+            unprofiled_files = []
+            primary_medias = {}
+            for _path in file_list:
+                parsed_profile = None
+                try:
+                    parsed_profile = parser_chain.extract(os.path.basename(_path))
+                except Exception:
+                    parsed_profile = None
+                if parsed_profile is None or not getattr(parsed_profile, "content_profile", None):
+                    # 普通媒体：非 TMDB 主源先按策略识别，命中则完全跳过 TMDB。
+                    if self._metadata_service is not None and not policy.startswith("tmdb_"):
+                        try:
+                            candidate = meta_info_fn(os.path.basename(_path))
+                            if self._metadata_service.identify_anchor(candidate, policy=policy):
+                                primary_medias[_path] = candidate
+                                continue
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(f"[Rmt]主源预识别失败: {exc}")
+                    unprofiled_files.append(_path)
+                    continue
+                parsed_code = getattr(parsed_profile, "anchor_external_id", "") or getattr(
+                    parsed_profile, "content_id", ""
+                )
+                _info = meta_info_fn(
+                    str(parsed_code or os.path.splitext(os.path.basename(_path))[0]),
+                    mtype=getattr(parsed_profile, "type", None) or MediaType.MOVIE,
+                )
+                _info.org_string = os.path.basename(_path)
+                _info.content_profile = parsed_profile.content_profile
+                _info.anchor_provider = getattr(parsed_profile, "anchor_provider", "") or ""
+                _info.anchor_external_id = str(parsed_code or "")
+                if parsed_code:
+                    _info.title = str(parsed_code)
+                profile_medias[_path] = _info
+
+            medias = {**primary_medias, **profile_medias}
+            if unprofiled_files:
+                identified = self.media.get_media_info_on_files(
+                    unprofiled_files,
+                    provider_data,
+                    media_type,
+                    season,
+                    episode[0],
+                    backend=src_backend,
+                )
+                if identified:
+                    medias.update(identified)
             if not medias:
                 return self._finish_transfer(False, "搜索媒体信息出错")
+
+            for _path, _info in medias.items():
+                if not getattr(_info, "org_string", ""):
+                    _info.org_string = os.path.basename(_path)
+                if not getattr(_info, "title", ""):
+                    _info.title = os.path.splitext(os.path.basename(_path))[0]
+                if self._metadata_service is not None:
+                    try:
+                        self._metadata_service.identify_anchor(_info, policy=policy)
+                        _snapshot = self._metadata_service.compose_for_media(
+                            _info,
+                            policy=policy,
+                            with_episodes=True,
+                            persist=True,
+                        )
+                        if _snapshot is not None:
+                            _info.snapshot = _snapshot
+                            self._apply_snapshot_to_media(_info, _snapshot)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(f"[Rmt]主源识别失败: {exc}")
 
             # 订阅/下载历史已知季集时兜底：文件名解析失败的动漫单集用订阅记录的集号补齐，
             # 避免"无法从文件名中识别出集数"导致订阅下载的剧集无法入库
@@ -472,6 +554,107 @@ class FileTransferService:
         except Exception as e:  # noqa: BLE001
             log.debug(f"[Rmt]蓝光目录检测失败: {e}")
         return None
+
+    @staticmethod
+    def _is_virtual_provider(provider: str) -> bool:
+        desc = getattr(metadata_registry.get_provider(provider), "descriptor", None)
+        return bool(getattr(desc, "virtual", False)) or provider == "content_id"
+
+    def _apply_snapshot_to_media(self, media_info, snapshot) -> None:
+        """把快照结果回填到 MediaInfo，供转移通知与命名使用."""
+
+        def _record_poster(record):
+            if not record:
+                return []
+            images = record.get("images") if isinstance(record, dict) else getattr(record, "images", {})
+            return (images or {}).get("poster") or []
+
+        def _poster_value(asset, key, default=None):
+            if isinstance(asset, dict):
+                return asset.get(key, default)
+            return getattr(asset, key, default)
+
+        fields = getattr(snapshot, "fields", {}) or {}
+        for key in ("title", "year"):
+            value = fields.get(key)
+            value = getattr(value, "value", value)
+            if value:
+                setattr(media_info, key, value)
+        poster = (getattr(snapshot, "images", {}) or {}).get("poster") or []
+        extra = getattr(snapshot, "extra", {}) or {}
+        source = extra.get("source_provider") or next(
+            (value for key, value in extra.items() if str(key).endswith(".source_provider")),
+            None,
+        )
+        if not poster and self._metadata_service is not None:
+            # 部分插件快照只带字段，图片在单独 lookup 中；用 refs 找一张真实海报。
+            for ref in getattr(snapshot, "refs", []) or []:
+                provider = str(getattr(ref, "provider", "") or "")
+                external_id = str(getattr(ref, "external_id", "") or "")
+                if (
+                    not provider
+                    or not external_id
+                    or self._is_virtual_provider(provider)
+                    or provider in {"tmdb", "imdb"}
+                ):
+                    continue
+                try:
+                    record = self._metadata_service.lookup(
+                        provider=provider,
+                        external_id=external_id,
+                        media_type=getattr(snapshot, "media_type", None),
+                        scope=str(getattr(media_info, "content_profile", "") or "default"),
+                        content_profile=str(getattr(media_info, "content_profile", "") or ""),
+                        allow_private=True,
+                    )
+                    poster = _record_poster(record)
+                    if poster:
+                        source = _poster_value(poster[0], "provider") or provider
+                        break
+                except Exception:
+                    continue
+        if not poster and self._metadata_service is not None:
+            source_ref = str(
+                extra.get("source_ref")
+                or next(
+                    (value for key, value in extra.items() if str(key).endswith(".source_ref")),
+                    "",
+                )
+            )
+            if not source_ref:
+                primary = str(getattr(snapshot, "primary_provider", "") or "")
+                external = str(getattr(media_info, "anchor_external_id", "") or "")
+                if primary and external:
+                    source_ref = f"{primary}:{external}"
+            if ":" in source_ref:
+                lookup_provider, lookup_external = source_ref.split(":", 1)
+                try:
+                    record = self._metadata_service.lookup(
+                        provider=lookup_provider,
+                        external_id=lookup_external,
+                        media_type=getattr(snapshot, "media_type", None) or getattr(media_info, "type", None),
+                        scope=str(getattr(media_info, "content_profile", "") or "default"),
+                        content_profile=str(getattr(media_info, "content_profile", "") or ""),
+                    )
+                    poster = _record_poster(record)
+                    if poster:
+                        source = _poster_value(poster[0], "provider") or source
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(f"[Rmt]主来源海报补全失败: {exc}")
+        if poster:
+            media_info.poster_path = _poster_value(poster[0], "url") or str(poster[0])
+        if (not source or self._is_virtual_provider(str(source))) and poster:
+            source = _poster_value(poster[0], "provider")
+        if not source or self._is_virtual_provider(str(source)):
+            for ref in getattr(snapshot, "refs", []) or []:
+                provider = str(getattr(ref, "provider", "") or "")
+                if provider and not self._is_virtual_provider(provider):
+                    source = provider
+                    break
+        if source:
+            media_info.anchor_provider = str(source)
+        elif getattr(snapshot, "primary_provider", ""):
+            media_info.anchor_provider = str(snapshot.primary_provider)
 
     def _discover_files(self, in_path, files, episode, min_filesize, src_backend=None):
         """发现待处理文件列表，返回 (bluray_disk_dir, file_list). 支持远程源（src_backend 非空）。"""
@@ -807,13 +990,24 @@ class FileTransferService:
 
                 reg_path = bluray_disk_dir if bluray_disk_dir else file_item
 
+                profile_ref = bool(
+                    media
+                    and getattr(media, "content_profile", "") not in (None, "", "default")
+                    and getattr(media, "anchor_external_id", "")
+                )
+                media_ref = str(getattr(media, "tmdb_id", "") or "").strip()
+                anchor_ref = bool(
+                    media and getattr(media, "anchor_provider", "") and getattr(media, "anchor_external_id", "")
+                )
+                parsed_media_ref = parse_media_ref(media_ref)
+                legacy_ref = bool(parsed_media_ref)
                 if (
                     not media
-                    or not media.tmdb_info
+                    or (not media.provider_data and not profile_ref and not legacy_ref and not anchor_ref)
                     or not media.get_title_string()
                     or media.get_title_string().strip().isdigit()
                     or len(media.get_title_string().strip()) < 2
-                    or not int(media.tmdb_id or 0)
+                    or (not profile_ref and not legacy_ref and not anchor_ref and not media_ref)
                 ):
                     fc, ac, am = self._handle_unrecognized_file(
                         file_item,
@@ -897,8 +1091,19 @@ class FileTransferService:
                     continue
 
                 file_ext = os.path.splitext(file_item)[-1]
-                media.set_tmdb_info(
-                    self.media.get_tmdb_info(mtype=media.type, tmdbid=media.tmdb_id, append_to_response="all")
+                raw_tmdb_id = str(media.tmdb_id or "").strip()
+                if raw_tmdb_id.isdigit():
+                    media.set_provider_data(
+                        self.media.get_tmdb_info(
+                            mtype=media.type,
+                            tmdbid=raw_tmdb_id,
+                            append_to_response="all",
+                        )
+                    )
+                snapshot = (
+                    self._metadata_service.latest_snapshot_for_media(media)
+                    if self._metadata_service is not None
+                    else None
                 )
                 out_path = new_file if not bluray_disk_dir else ret_dir_path
                 season_episode = media.get_season_episode_string() if out_path else media.get_season_string()
@@ -906,9 +1111,13 @@ class FileTransferService:
                     title=media.title or "",
                     type_value=media.type.value if media.type else "",
                     category=media.category or "",
-                    tmdb_id=int(media.tmdb_id) if media.tmdb_id else 0,
+                    tmdb_id=int(raw_tmdb_id) if raw_tmdb_id.isdigit() else 0,
                     year=media.year or "",
                     season_episode=season_episode,
+                    identity_id=getattr(snapshot, "identity_id", None),
+                    anchor_provider=getattr(media, "anchor_provider", None),
+                    anchor_external_id=getattr(media, "anchor_external_id", None),
+                    content_profile=getattr(media, "content_profile", None),
                 )
 
                 self._history.insert_transfer_history(

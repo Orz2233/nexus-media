@@ -44,6 +44,8 @@ def _parse_root(root, path: str) -> dict[str, Any]:
                 "year": _year(root),
                 "tmdbid": _unique_id(root, "tmdb") or _text(root, "tmdbid"),
                 "imdbid": _unique_id(root, "imdb") or _text(root, "imdbid"),
+                "content_id": _unique_id(root, "content_id"),
+                "unique_ids": _unique_ids(root),
                 "original_title": _text(root, "originaltitle"),
             }
         )
@@ -171,6 +173,16 @@ def _year(root) -> str | None:
         return year[:4]
     premiered = _text(root, "premiered")
     return premiered[:4] if premiered else None
+
+
+def _unique_ids(root) -> dict[str, str]:
+    result = {}
+    for elem in root.findall("uniqueid"):
+        id_type = str(elem.get("type") or "").strip().lower()
+        text = (elem.text or "").strip()
+        if id_type and text:
+            result[id_type] = text
+    return result
 
 
 def _unique_id(root, id_type: str) -> str | None:

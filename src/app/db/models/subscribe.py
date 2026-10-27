@@ -30,6 +30,14 @@ class SubscribeHistory(Base):
     START: Mapped[int] = mapped_column(Integer)
     FINISH_TIME: Mapped[str] = mapped_column(String(255))
     NOTE: Mapped[str] = mapped_column(Text)
+    IDENTITY_ID: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    ANCHOR_PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ANCHOR_EXTERNAL_ID: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    CONTENT_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    METADATA_REF: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    METADATA_POLICY: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    NAMING_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     def as_dict(self) -> dict[str, Any]:
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -37,7 +45,16 @@ class SubscribeHistory(Base):
 
 class SubscribeMovies(Base):
     __tablename__ = "SUBSCRIBE_MOVIES"
-    __table_args__ = (Index("UQ_SUBSCRIBE_MOVIES_USER_TMDB", "USER_ID", "TMDBID", unique=True),)
+    __table_args__ = (
+        Index(
+            "UQ_SUBSCRIBE_MOVIES_USER_ANCHOR",
+            "USER_ID",
+            "ANCHOR_PROVIDER",
+            "ANCHOR_EXTERNAL_ID",
+            unique=True,
+        ),
+        Index("INDX_SUBSCRIBE_MOVIES_IDENTITY", "IDENTITY_ID"),
+    )
 
     ID: Mapped[int] = mapped_column(Integer, Sequence("ID"), primary_key=True)
     USER_ID: Mapped[int | None] = mapped_column(
@@ -67,6 +84,14 @@ class SubscribeMovies(Base):
     DESC: Mapped[str] = mapped_column(String(255), nullable=True)
     NOTE: Mapped[str] = mapped_column(Text, nullable=True)
     ADD_DATE: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    IDENTITY_ID: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    ANCHOR_PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ANCHOR_EXTERNAL_ID: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    CONTENT_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    METADATA_REF: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    METADATA_POLICY: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    NAMING_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     def as_dict(self) -> dict[str, Any]:
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -84,11 +109,25 @@ class SubscribeTorrents(Base):
     YEAR: Mapped[str] = mapped_column(String(10))
     SEASON: Mapped[str] = mapped_column(String(10))
     EPISODE: Mapped[str] = mapped_column(String(10))
+    IDENTITY_ID: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    ANCHOR_PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ANCHOR_EXTERNAL_ID: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    CONTENT_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class SubscribeTvs(Base):
     __tablename__ = "SUBSCRIBE_TVS"
-    __table_args__ = (Index("UQ_SUBSCRIBE_TVS_USER_TMDB_SEASON", "USER_ID", "TMDBID", "SEASON", unique=True),)
+    __table_args__ = (
+        Index(
+            "UQ_SUBSCRIBE_TVS_USER_ANCHOR_SEASON",
+            "USER_ID",
+            "ANCHOR_PROVIDER",
+            "ANCHOR_EXTERNAL_ID",
+            "SEASON",
+            unique=True,
+        ),
+        Index("INDX_SUBSCRIBE_TVS_IDENTITY", "IDENTITY_ID"),
+    )
 
     ID: Mapped[int] = mapped_column(Integer, Sequence("ID"), primary_key=True)
     USER_ID: Mapped[int | None] = mapped_column(
@@ -123,6 +162,14 @@ class SubscribeTvs(Base):
     DESC: Mapped[str] = mapped_column(String(255), nullable=True)
     NOTE: Mapped[str] = mapped_column(Text, nullable=True)
     ADD_DATE: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    IDENTITY_ID: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    ANCHOR_PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ANCHOR_EXTERNAL_ID: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    CONTENT_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    METADATA_REF: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    METADATA_POLICY: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    NAMING_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     def as_dict(self) -> dict[str, Any]:
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -138,3 +185,9 @@ class SubscribeTvEpisodes(Base):
     RSSID: Mapped[str] = mapped_column(String(255), index=True)
     # 集号列表（如 1,2,3,...）可能很长，MySQL 下 varchar(255) 会溢出
     EPISODES: Mapped[str] = mapped_column(Text)
+    IDENTITY_ID: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    ANCHOR_PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ANCHOR_EXTERNAL_ID: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    CONTENT_PROFILE: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    PROVIDER: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    METADATA_REF: Mapped[str | None] = mapped_column(String(512), nullable=True)

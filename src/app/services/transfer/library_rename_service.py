@@ -44,6 +44,7 @@ class LibraryRenameService:
         download_repo,
         thread_executor,
         transfer_history_service=None,
+        metadata_service=None,
     ):
         self._repo = rename_repo
         self._storage_repo = storage_repo
@@ -53,6 +54,7 @@ class LibraryRenameService:
         self._download_repo = download_repo
         self._thread_executor = thread_executor
         self._transfer_history_service = transfer_history_service
+        self._metadata_service = metadata_service
         self._category_repo = CategoryConfigRepositoryAdapter()
         self._executor = LibraryRenameExecutor(
             rename_repo,
@@ -72,6 +74,7 @@ class LibraryRenameService:
             resolver,
             self._media_service,
             self._category_repo,
+            metadata_service=self._metadata_service,
         )
         rule_snapshot = planner.prepare(scope)
         items = planner.build_items(scope)
@@ -213,6 +216,10 @@ class LibraryRenameService:
                 "title": title or "",
                 "year": year or "",
                 "tmdbid": tmdbid or "",
+                "anchor_provider": "tmdb" if tmdbid else None,
+                "anchor_external_id": str(tmdbid) if tmdbid else None,
+                "content_profile": "default",
+                "metadata_policy": "tmdb_primary" if tmdbid else None,
                 "season": season if season is not None else "",
                 "episode": episode if episode is not None else "",
                 "metadata_source": "manual",
@@ -252,6 +259,7 @@ class LibraryRenameService:
             allow_online_metadata=bool(data.get("allow_online_metadata", False)),
             reidentify_no_metadata=bool(data.get("reidentify_no_metadata", False)),
             limit=max(1, min(limit, _MAX_LIMIT)),
+            server_id=int(data["server_id"]) if data.get("server_id") else None,
         )
 
     def _validate_library_path(self, backend_id: str, path: str) -> None:
