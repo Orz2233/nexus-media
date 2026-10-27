@@ -86,6 +86,7 @@ def build_coordinators(
         message=message,
         system_config=system_config,
         site_grant_service=services.site_grant_service,
+        custom_rss=services.custom_rss_service,
     )
     indexer_strategy = IndexerSearchStrategy(
         service=subscribe_service,
@@ -163,6 +164,7 @@ def build_coordinators(
         message_client_service=services.message_client_service,
         rbac_service=services.rbac_service,
         site_grant_service=services.site_grant_service,
+        metadata_service=services.metadata_service,
         media_server_config_service=services.media_server_config_service,
         indexer_config_service=services.indexer_config_service,
         system_config_service=services.system_config_service,

@@ -236,7 +236,10 @@ class Jellyfin(_IMediaClient):
         """
         if not self._host or not self._apikey:
             return []
-        req_url = f"{self._host}System/ActivityLog/Entries?api_key={self._apikey}&Limit={num}"
+        req_url = (
+            f"{self._host}System/ActivityLog/Entries?api_key={self._apikey}"
+            f"&Limit={num}&SortBy=DateCreated&SortOrder=Descending"
+        )
         ret_array = []
         try:
             res = HttpClient().get(req_url, headers=self._auth_headers())
@@ -244,17 +247,27 @@ class Jellyfin(_IMediaClient):
                 ret_json = res.json()
                 items = ret_json.get("Items")
                 for item in items:
-                    if item.get("Type") == "SessionStarted":
+                    item_type = str(item.get("Type") or "")
+                    if item_type in ("SessionStarted", "user.authenticated"):
                         event_type = "LG"
                         event_date = re.sub(r"\dZ", "Z", item.get("Date"))
-                        event_str = "{}, {}".format(item.get("Name"), item.get("ShortOverview"))
+                        event_str = ", ".join(
+                            str(part) for part in (item.get("Name"), item.get("ShortOverview")) if part
+                        )
                         activity = {
                             "type": event_type,
                             "event": event_str,
                             "date": SystemUtils.get_local_time(event_date),
                         }
                         ret_array.append(activity)
-                    if item.get("Type") in ["VideoPlayback", "VideoPlaybackStopped"]:
+                    if item_type in (
+                        "VideoPlayback",
+                        "VideoPlaybackStopped",
+                        "PlaybackStart",
+                        "PlaybackStop",
+                        "playback.start",
+                        "playback.stop",
+                    ):
                         event_type = "PL"
                         event_date = re.sub(r"\dZ", "Z", item.get("Date"))
                         activity = {
@@ -272,7 +285,7 @@ class Jellyfin(_IMediaClient):
             ExceptionUtils.exception_traceback(e)
             log.error(f"[{self.client_name}]连接System/ActivityLog/Entries出错：" + str(e))
             return []
-        return ret_array
+        return sorted(ret_array, key=lambda item: str(item.get("date") or ""), reverse=True)
 
     def get_medias_count(self):
         """
@@ -526,6 +539,21 @@ class Jellyfin(_IMediaClient):
                 return self.get_nt_image_url(url=image_url, remote=True)
             return image_url
 
+    def refresh_library(self, item_id):
+        """按媒体库 Item ID 刷新。"""
+        if not self._host or not self._apikey:
+            return False
+        req_url = f"{self._host}Items/{item_id}/Refresh?Recursive=true&api_key={self._apikey}"
+        try:
+            res = HttpClient().post(req_url, headers=self._auth_headers())
+            return bool(res)
+        except (InfrastructureError, MediaServerError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            ExceptionUtils.exception_traceback(e)
+            log.error(f"[{self.client_name}]连接Items/Refresh出错：" + str(e))
+            return False
+
     def refresh_root_library(self):
         """
         通知Jellyfin刷新整个媒体库
@@ -547,16 +575,14 @@ class Jellyfin(_IMediaClient):
             return False
 
     def refresh_library_by_items(self, items):
-        """
-        按类型、名称、年份来刷新媒体库，Jellyfin没有刷单个项目的API，这里直接刷新整个库
-        :param items: 已识别的需要刷新媒体库的媒体信息列表
-        """
-        # 没找到单项目刷新的对应的API，先按全库刷新
+        """优先按媒体库 ID 刷新，未指定时刷新整个库。"""
         if not items:
             return False
-        if not self._host or not self._apikey:
-            return False
-        return self.refresh_root_library()
+        for library_id in {str(item["library_id"]) for item in items if item.get("library_id")}:
+            self.refresh_library(library_id)
+        if any(not item.get("library_id") for item in items):
+            self.refresh_root_library()
+        return True
 
     def get_libraries(self):
         """

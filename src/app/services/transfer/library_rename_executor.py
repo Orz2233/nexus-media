@@ -275,6 +275,10 @@ class LibraryRenameExecutor:
             "title": snapshot.get("title") or "",
             "year": snapshot.get("year") or "",
             "tmdbid": snapshot.get("tmdbid") or "",
+            "anchor_provider": snapshot.get("anchor_provider"),
+            "anchor_external_id": snapshot.get("anchor_external_id"),
+            "identity_id": snapshot.get("identity_id"),
+            "content_profile": snapshot.get("content_profile") or "default",
             "season": snapshot.get("season") or "",
             "episode": snapshot.get("episode") or "",
             "season_episode_count": snapshot.get("season_episode_count"),
@@ -332,12 +336,27 @@ class LibraryRenameExecutor:
                         "title": snapshot.get("title") or "",
                         "year": snapshot.get("year") or "",
                         "type": snapshot.get("type") or "",
+                        "content_profile": snapshot.get("content_profile") or "default",
+                        "target_path": path,
                     }
                 )
         if not items:
             return
+        job = self._repo.get_job(job_id) or {}
         try:
-            self._media_server.refresh_library_by_items(items)
+            scope = JsonUtils.loads(job.get("SCOPE") or "{}")
+        except Exception:  # noqa: BLE001
+            scope = {}
+        try:
+            grouped: dict[str, list[dict]] = {}
+            for item in items:
+                grouped.setdefault(item.get("content_profile") or "default", []).append(item)
+            for profile, profile_items in grouped.items():
+                self._media_server.refresh_library_by_items(
+                    profile_items,
+                    server_id=scope.get("server_id"),
+                    content_profile=profile,
+                )
         except Exception as e:  # noqa: BLE001
             log.warn(f"[LibraryRename]刷新媒体服务器失败: {e}")
 

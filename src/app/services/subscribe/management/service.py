@@ -50,6 +50,7 @@ class SubscribeService:
         download_repo: Any = None,
         transfer_history_manager: Any = None,
         user_repo: Any = None,
+        metadata_service: Any = None,
     ):
         self._movie_repo = movie_repo
         self._tv_repo = tv_repo
@@ -88,6 +89,7 @@ class SubscribeService:
             self._web_utils,
             self._download_repo,
             self._transfer_history_manager,
+            metadata_service,
         )
         self._finish_svc = SubscribeFinishService(
             self._movie_repo, self._tv_repo, self._history_repo, self._message, self._event_bus, self._download_repo
@@ -103,7 +105,9 @@ class SubscribeService:
             self._indexer_service,
             user_repo,
         )
-        self._refresh_svc = SubscribeRefreshService(self._movie_repo, self._tv_repo, self._tv_episode_repo, self._media)
+        self._refresh_svc = SubscribeRefreshService(
+            self._movie_repo, self._tv_repo, self._tv_episode_repo, self._media, metadata_service
+        )
 
     @property
     def default_subscribe_setting_tv(self) -> dict | None:
@@ -184,13 +188,20 @@ class SubscribeService:
                 media = MediaInfo(type=MediaType.MOVIE, tmdb_id=str(getattr(mv, "tmdb_id", "") or ""))
                 media.title = getattr(mv, "name", "") or ""
                 media.year = getattr(mv, "year", "") or ""
-                if self.media_exists(media):
+                profile = str(getattr(mv, "content_profile", "") or "default")
+                if profile != "default":
+                    # 插件内容画像不依赖 TMDB；进入 COMPLETED 即视为转移登记完成。
+                    self.finalize_movie_by_rssid(mv.id)
+                elif self.media_exists(media):
                     self.finalize_movie_by_rssid(mv.id)
                 elif self._pending_stale(getattr(mv, "tmdb_id", ""), cutoff):
                     self.update_rss_state(MediaType.MOVIE, mv.id, SubscribeState.RUNNING.value)
                     log.info(f"[Subscribe]电影待转移超时，重开订阅 rid={mv.id}（{media.title}）")
             except Exception as e:  # noqa: BLE001
                 log.warn(f"[Subscribe]待转移电影清理失败 rid={getattr(mv, 'id', None)}: {e!s}")
+
+    def get_subscription_count(self, user=None):
+        return self._query_svc.get_subscription_count(user=user)
 
     def get_subscribe_movies(self, rid=None, state=None, user=None):
         return self._query_svc.get_subscribe_movies(rid, state, user=user)
@@ -200,6 +211,15 @@ class SubscribeService:
 
     def get_subscribe_tv_episodes(self, rssid):
         return self._query_svc.get_subscribe_tv_episodes(rssid)
+
+    def get_subscribe_by_anchor(
+        self,
+        anchor_provider: str | None,
+        anchor_external_id: str | None,
+        mtype: MediaType,
+        user: Any = None,
+    ) -> dict | None:
+        return self._query_svc.get_subscribe_by_anchor(anchor_provider, anchor_external_id, mtype, user=user)
 
     def get_subscribe_seasons(self, tmdbid=None, title=None, year=None, user=None):
         return self._query_svc.get_subscribe_seasons(tmdbid, title, year, user=user)
@@ -255,8 +275,25 @@ class SubscribeService:
     def get_history_id(self, mtype, title, year=None, tmdbid=None):
         return self._query_svc.get_history_id(mtype, title, year, tmdbid)
 
-    def get_subscribe_id(self, mtype, title, year=None, season=None, tmdbid=None):
-        return self._query_svc.get_subscribe_id(mtype, title, year, season, tmdbid)
+    def get_subscribe_id(
+        self,
+        mtype,
+        title,
+        year=None,
+        season=None,
+        tmdbid=None,
+        user_id=None,
+        content_profile=None,
+    ):
+        return self._query_svc.get_subscribe_id(
+            mtype,
+            title,
+            year,
+            season,
+            tmdbid,
+            user_id=user_id,
+            content_profile=content_profile,
+        )
 
     def refresh_rss_metainfo(self):
         return self._refresh_svc.refresh_rss_metainfo(self.get_subscribe_movies, self.get_subscribe_tvs)
