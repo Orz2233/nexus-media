@@ -10,9 +10,20 @@ import log
 from app.domain.enums import SearchType, SystemConfigKey
 from app.domain.mediatypes import MediaType
 from app.media import meta_info
+from app.media.lookup.tmdb_client import compare_tmdb_names
 from app.services.search_context import SearchContext
 from app.services.search_orchestrator import SearchOrchestrator
 from app.services.web.utils import get_mediainfo_from_id
+
+
+def _media_name_matches(query: str, media: Any) -> bool:
+    names = (
+        getattr(media, "title", None),
+        getattr(media, "cn_name", None),
+        getattr(media, "en_name", None),
+        getattr(media, "original_title", None),
+    )
+    return any(compare_tmdb_names(query, name) for name in names if isinstance(name, str) and name.strip())
 
 
 def make_web_search_fn(orchestrator: SearchOrchestrator, system_config: Any):
@@ -29,7 +40,31 @@ def make_web_search_fn(orchestrator: SearchOrchestrator, system_config: Any):
     ) -> tuple[int, str]:
         match_media = None
         if tmdbid:
-            match_media = get_mediainfo_from_id(mtype=media_type, mediaid=tmdbid)
+            if media_type:
+                match_media = get_mediainfo_from_id(mtype=media_type, mediaid=tmdbid)
+            else:
+                candidates = []
+                for candidate_type in (MediaType.TV, MediaType.MOVIE):
+                    candidate = get_mediainfo_from_id(mtype=candidate_type, mediaid=tmdbid)
+                    if candidate:
+                        candidates.append((candidate_type, candidate))
+                if len(candidates) == 1:
+                    media_type, match_media = candidates[0]
+                elif len(candidates) > 1:
+                    matched = [
+                        (candidate_type, candidate)
+                        for candidate_type, candidate in candidates
+                        if _media_name_matches(content, candidate)
+                    ]
+                    if len(matched) == 1:
+                        chosen_type, match_media = matched[0]
+                        media_type = chosen_type
+                        log.info(
+                            f"[WebSearch]{content} 的 TMDB {tmdbid} 同时存在电影和电视剧，"
+                            f"按标题选择 {chosen_type.value}"
+                        )
+                    else:
+                        return -1, f"{content} 的 TMDB {tmdbid} 同时存在电影和电视剧，无法确定类型"
             if not match_media:
                 return -1, f"{content} 未识别到媒体信息！"
 

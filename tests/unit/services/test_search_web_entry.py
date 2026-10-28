@@ -46,6 +46,55 @@ class TestMakeWebSearchFn:
         assert code == -1
         orchestrator.orchestrate.assert_not_called()
 
+    def test_tmdbid_without_type_queries_tv_then_movie(self):
+        orchestrator = MagicMock()
+        orchestrator.orchestrate.return_value = (None, {}, 3, 0)
+        tv = MagicMock(title="大主宰", cn_name="大主宰", en_name="The Great Ruler", original_title="大主宰")
+        with patch(
+            "app.services.search_web_entry.get_mediainfo_from_id",
+            side_effect=[tv, None],
+        ) as get_media:
+            fn = make_web_search_fn(orchestrator, system_config=None)
+            code, _ = fn("大主宰", tmdbid="226045")
+
+        assert code == 0
+        assert get_media.call_count == 2
+        ctx = orchestrator.orchestrate.call_args[0][0]
+        assert ctx.match_media is tv
+        assert ctx.media_type == MediaType.TV
+
+    def test_tmdbid_without_type_uses_title_to_break_collision(self):
+        orchestrator = MagicMock()
+        orchestrator.orchestrate.return_value = (None, {}, 3, 0)
+        tv = MagicMock(title="大主宰", cn_name="大主宰", en_name="The Great Ruler", original_title="大主宰")
+        movie = MagicMock(title="Americatown", cn_name=None, en_name=None, original_title=None)
+        with patch(
+            "app.services.search_web_entry.get_mediainfo_from_id",
+            side_effect=[tv, movie],
+        ):
+            fn = make_web_search_fn(orchestrator, system_config=None)
+            code, _ = fn("大主宰", tmdbid="226045")
+
+        assert code == 0
+        ctx = orchestrator.orchestrate.call_args[0][0]
+        assert ctx.match_media is tv
+        assert ctx.media_type == MediaType.TV
+
+    def test_ambiguous_tmdbid_without_type_is_rejected(self):
+        orchestrator = MagicMock()
+        tv = MagicMock(title="同名作品", cn_name="同名作品", en_name=None, original_title="同名作品")
+        movie = MagicMock(title="同名作品", cn_name="同名作品", en_name=None, original_title="同名作品")
+        with patch(
+            "app.services.search_web_entry.get_mediainfo_from_id",
+            side_effect=[tv, movie],
+        ):
+            fn = make_web_search_fn(orchestrator, system_config=None)
+            code, msg = fn("同名作品", tmdbid="123")
+
+        assert code == -1
+        assert "无法确定类型" in msg
+        orchestrator.orchestrate.assert_not_called()
+
     def test_default_sites_applied(self):
         orchestrator = MagicMock()
         orchestrator.orchestrate.return_value = (None, {}, 1, 0)
