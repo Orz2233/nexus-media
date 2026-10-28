@@ -42,3 +42,20 @@ def test_web_search_uses_movie_for_non_default_profile():
 
     assert captured["media_type"] == MediaType.MOVIE
     assert captured["filters"]["content_profile"] == "plugin-profile"
+
+
+def test_web_search_queries_anime_with_tv_media_type():
+    captured = {}
+
+    def search_fn(**kwargs):
+        captured.update(kwargs)
+        return 1, ""
+
+    WebSearchService(search_fn).search(
+        "大主宰",
+        tmdbid="226045",
+        media_type="anime",
+    )
+
+    assert captured["media_type"] == MediaType.TV
+    assert captured["tmdbid"] == "226045"
