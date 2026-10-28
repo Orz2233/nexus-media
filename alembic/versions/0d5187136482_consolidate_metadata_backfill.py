@@ -37,6 +37,19 @@ def _new_ulid() -> str:
     return "".join(reversed(chars))
 
 
+def _ref_id_value(connection, refs: sa.Table) -> dict:
+    """仅在主键没有数据库默认/自增时才手工补 ID.
+
+    PostgreSQL 的 Sequence、MySQL 的 AUTO_INCREMENT、SQLite 的 INTEGER PRIMARY KEY
+    都会自行生成主键；显式 max+1 会绕过序列，导致后续 ORM 插入冲突。
+    """
+    column = refs.c.ID
+    if column.server_default is not None or column.autoincrement in (True, "auto"):
+        return {}
+    current = connection.execute(sa.select(sa.func.coalesce(sa.func.max(column), 0))).scalar()
+    return {"ID": int(current or 0) + 1}
+
+
 def _identity(raw: str):
     value = str(raw or "").strip()
     upper = value.upper()
@@ -122,6 +135,7 @@ def upgrade() -> None:
                 )
                 connection.execute(
                     refs.insert().values(
+                        **_ref_id_value(connection, refs),
                         IDENTITY_ID=identity_id,
                         PROVIDER=provider,
                         EXTERNAL_ID=external,
