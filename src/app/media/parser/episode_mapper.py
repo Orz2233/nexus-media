@@ -206,8 +206,8 @@ class EpisodeMapper:
         """
         自动选择映射策略
 
-        - 高集号(>26)/无季号/season=1: 绝对集号映射
-        - season>1: 合并季 / 部分错位映射（→ _fetch_blocks）
+        - 无季号/season=1: 绝对集号映射
+        - season>1: 优先保留显式季号；低集号再尝试合并季 / 部分错位映射
         - 返回 None = 无需映射
         """
         if not source_episode or source_episode < 1:
@@ -234,8 +234,8 @@ class EpisodeMapper:
                     return 1, 0
             return None
 
-        # 高集号 / 无季号 / season=1 → 先查 TMDB 是否有该季
-        if (not source_season or source_season == 1 or source_episode > 26) and self._tmdb:
+        # 无季号 / season=1 → 先查 TMDB 是否有该季
+        if (not source_season or source_season == 1) and self._tmdb:
             cache_key = f"abs:{tmdb_id}"
             seasons = self._blocks.get(cache_key)
             if not seasons:
@@ -255,7 +255,7 @@ class EpisodeMapper:
                         break
             return self.map_absolute(tmdb_id, source_episode, source_end_ep)
 
-        # season>1 + ep≤26 → 先快速检查 TMDB 是否已有该季
+        # season>1 → 先快速检查 TMDB 是否已有该季
         if self._tmdb:
             cache_key = f"abs:{tmdb_id}"
             seasons = self._blocks.get(cache_key)
@@ -275,6 +275,14 @@ class EpisodeMapper:
                         if 1 <= source_episode <= count:
                             return None
                         break
+
+        # 显式高集号可能是季内编号，不能可靠地当成绝对集号。
+        if source_season and source_season > 1 and source_episode > 26:
+            log.info(
+                f"[EpisodeMapper]TMDB:{tmdb_id} S{source_season:02d}E{source_episode:02d} "
+                "保留原季集，不按绝对集号映射"
+            )
+            return None
 
         # TMDB 没有该季（动漫常按季度连贯编号：S03E01 = 绝对第 49 集）→
         # 回退到由 air_date 推断出的季块映射（合并季 → S01E绝对集号）

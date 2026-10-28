@@ -74,3 +74,12 @@ class TestMergedSeasonFallback:
             assert mapper.map_auto(220542, 3, 1) is None
         finally:
             patcher.stop()
+
+    def test_explicit_season_high_episode_not_treated_as_absolute(self):
+        """显式 S02E40 不应被当成无季号的绝对第 40 集."""
+        mapper, patcher = _mapper(MERGED_TMDB, MERGED_BLOCKS)
+        try:
+            assert mapper.map_auto(220542, None, 40) == (1, 40)
+            assert mapper.map_auto(220542, 2, 40, 43) is None
+        finally:
+            patcher.stop()
