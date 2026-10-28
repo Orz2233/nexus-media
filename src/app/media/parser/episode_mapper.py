@@ -40,7 +40,8 @@ class EpisodeMapper:
     def __init__(self, tmdb_lookup: TmdbLookup | None = None):
         self._tmdb = tmdb_lookup
         # 缓存: tmdb_id -> [(block_season, start_ep, end_ep), ...]
-        self._blocks: dict[int | str, list[tuple[int, int, int]]] = {}
+        self._blocks: dict[int, list[tuple[int, int, int]]] = {}
+        self._seasons: dict[int, list[dict]] = {}
 
     def _fetch_blocks(self, tmdb_id: int) -> list[tuple[int, int, int]] | None:
         """从 TMDB 获取 episodes，按 air_date 推断季分界"""
@@ -206,22 +207,21 @@ class EpisodeMapper:
         """
         自动选择映射策略
 
-        - 无季号/season=1: 绝对集号映射
-        - season>1: 优先保留显式季号；低集号再尝试合并季 / 部分错位映射
+        - 无季号: 绝对集号直接归入 S01
+        - 有季号: 按 TMDB 季集数或推断季块累计归入 S01
         - 返回 None = 无需映射
         """
         if not source_episode or source_episode < 1:
             # 季节包（无集号）：先检查 TMDB 是否有该季
             if source_season and source_season > 1 and self._tmdb:
-                cache_key2 = f"seasons:{tmdb_id}"
-                seasons = self._blocks.get(cache_key2)
+                seasons = self._seasons.get(tmdb_id)
                 if not seasons:
                     try:
                         tv_info = self._tmdb.get_tmdb_info(MediaType.TV, tmdb_id)
                         if tv_info:
                             raw = [s for s in tv_info.get("seasons", []) if s.get("season_number", 0) > 0]
                             seasons = sorted(raw, key=lambda s: s.get("season_number", 0))
-                            self._blocks[cache_key2] = seasons
+                            self._seasons[tmdb_id] = seasons
                     except Exception:
                         seasons = None
                 if seasons:
@@ -234,38 +234,22 @@ class EpisodeMapper:
                     return 1, 0
             return None
 
-        # 无季号 / season=1 → 先查 TMDB 是否有该季
-        if (not source_season or source_season == 1) and self._tmdb:
-            cache_key = f"abs:{tmdb_id}"
-            seasons = self._blocks.get(cache_key)
-            if not seasons:
-                try:
-                    tv_info = self._tmdb.get_tmdb_info(MediaType.TV, tmdb_id)
-                    if tv_info:
-                        raw = [s for s in tv_info.get("seasons", []) if s.get("season_number", 0) > 0]
-                        seasons = sorted(raw, key=lambda s: s.get("season_number", 0))
-                        self._blocks[cache_key] = seasons
-                except Exception:
-                    seasons = None
-            if seasons and source_season:
-                for s in seasons:
-                    if s.get("season_number") == source_season:  # type: ignore[reportAttributeAccessIssue]
-                        if 1 <= (source_episode or 1) <= s.get("episode_count", 0):  # type: ignore[reportAttributeAccessIssue]
-                            return None  # TMDB 已有该季且集号在范围内
-                        break
-            return self.map_absolute(tmdb_id, source_episode, source_end_ep)
+        # 无季号按绝对集号处理，并统一归入 S01。
+        if not source_season:
+            if source_end_ep and source_end_ep != source_episode:
+                return 1, source_episode, 1, source_end_ep
+            return 1, source_episode
 
-        # season>1 → 先快速检查 TMDB 是否已有该季
+        # TMDB 已有对应季时，按前序季集数累计到 S01。
         if self._tmdb:
-            cache_key = f"abs:{tmdb_id}"
-            seasons = self._blocks.get(cache_key)
+            seasons = self._seasons.get(tmdb_id)
             if not seasons:
                 try:
                     tv_info = self._tmdb.get_tmdb_info(MediaType.TV, tmdb_id)
                     if tv_info:
                         raw = [s for s in tv_info.get("seasons", []) if s.get("season_number", 0) > 0]
                         seasons = sorted(raw, key=lambda s: s.get("season_number", 0))
-                        self._blocks[cache_key] = seasons
+                        self._seasons[tmdb_id] = seasons
                 except Exception:
                     seasons = None
             if seasons:
@@ -273,23 +257,28 @@ class EpisodeMapper:
                     if s.get("season_number") == source_season:  # type: ignore[reportAttributeAccessIssue]
                         count = s.get("episode_count", 0)  # type: ignore[reportAttributeAccessIssue]
                         if 1 <= source_episode <= count:
-                            return None
+                            if source_season == 1:
+                                return None
+                            offset = sum(
+                                int(prev.get("episode_count", 0))
+                                for prev in seasons
+                                if prev.get("season_number", 0) < source_season
+                            )
+                            target_start = offset + source_episode
+                            if source_end_ep and source_end_ep != source_episode:
+                                return 1, target_start, 1, offset + source_end_ep
+                            return 1, target_start
                         break
-
-        # 显式高集号可能是季内编号，不能可靠地当成绝对集号。
-        if source_season and source_season > 1 and source_episode > 26:
-            log.info(
-                f"[EpisodeMapper]TMDB:{tmdb_id} S{source_season:02d}E{source_episode:02d} "
-                "保留原季集，不按绝对集号映射"
-            )
-            return None
 
         # TMDB 没有该季（动漫常按季度连贯编号：S03E01 = 绝对第 49 集）→
         # 回退到由 air_date 推断出的季块映射（合并季 → S01E绝对集号）
         mapped = self.map(tmdb_id, source_season, source_episode, source_end_ep)
         if mapped:
             return mapped
-        # 快速检查未命中且无法回退 → 不猜测
+        log.warn(
+            f"[EpisodeMapper]TMDB:{tmdb_id} S{source_season:02d}E{source_episode:02d} "
+            "无法确定季块偏移，保留原季集以避免重复集号"
+        )
         return None
 
     def map_batch(self, items: list[dict]) -> list[tuple[int, int] | tuple[int, int, int, int] | None]:
@@ -312,24 +301,10 @@ class EpisodeMapper:
             if item.get("tmdb_id") and item["tmdb_id"] not in self._blocks and item.get("season") and item["season"] > 1
         }
 
-        # 按 tmdb_id 去重，只查未缓存的（绝对集号缓存）
-        # season=None / season=1 / episode>26 都会走 map_absolute
-        tmdb_ids_abs = {
-            item["tmdb_id"]
-            for item in items
-            if item.get("tmdb_id")
-            and f"abs:{item['tmdb_id']}" not in self._blocks
-            and (not item.get("season") or item.get("season") == 1 or (item.get("episode", 0) or 0) > 26)
-        }
-
         # 并发查询多个不同 tmdb_id
         if tmdb_ids_blocks:
             with ThreadPoolExecutor(max_workers=min(len(tmdb_ids_blocks), 5)) as executor:
                 list(executor.map(self._fetch_blocks, tmdb_ids_blocks))
-
-        if tmdb_ids_abs:
-            with ThreadPoolExecutor(max_workers=min(len(tmdb_ids_abs), 5)) as executor:
-                list(executor.map(lambda tid: self.map_absolute(tid, 1), tmdb_ids_abs))
 
         # 批量计算映射结果
         results = []
@@ -361,8 +336,7 @@ class EpisodeMapper:
         if not self._tmdb:
             return None
 
-        cache_key = f"abs:{tmdb_id}"
-        seasons = self._blocks.get(cache_key)
+        seasons = self._seasons.get(tmdb_id)
 
         try:
             if not seasons:
@@ -373,13 +347,15 @@ class EpisodeMapper:
                 if not raw:
                     return None
                 seasons = sorted(raw, key=lambda s: s.get("season_number", 0))
-                self._blocks[cache_key] = seasons
+                self._seasons[tmdb_id] = seasons
 
             def _find(abs_ep: int) -> tuple[int, int] | None:
                 cum = 0
                 for season in seasons:
-                    sn = season.get("season_number")  # type: ignore[assignment]
-                    count = season.get("episode_count", 0)  # type: ignore[assignment]
+                    sn = season.get("season_number")
+                    count = season.get("episode_count", 0)
+                    if not isinstance(sn, int) or not isinstance(count, int):
+                        continue
                     start = cum + 1
                     end_ep_num = cum + count
                     cum += count
@@ -417,7 +393,7 @@ class EpisodeMapper:
 
     def invalidate(self, tmdb_id: int):
         self._blocks.pop(tmdb_id, None)
-        self._blocks.pop(f"abs:{tmdb_id}", None)
+        self._seasons.pop(tmdb_id, None)
 
 
 def _parse_date(date_str: str | None) -> datetime | None:

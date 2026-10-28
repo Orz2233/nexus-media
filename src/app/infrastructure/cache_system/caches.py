@@ -48,7 +48,7 @@ class TMDBCache(TypedCache):
     TTL_TRENDING = 2 * 3600  # 2 小时
     TTL_DEFAULT = 3600  # 1 小时（默认）
 
-    MEDIA_CACHE_VERSION = "2"  # 匹配逻辑变更时递增，自动作废旧缓存
+    MEDIA_CACHE_VERSION = "3"  # 匹配逻辑变更时递增，自动作废旧缓存
     TMDB_CACHE_VERSION = "2"  # 中文名补全逻辑变更时递增，自动作废旧缓存（旧缓存可能存英文名）
 
     def __init__(self, adapter: CacheAdapter | None = None):
