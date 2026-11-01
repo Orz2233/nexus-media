@@ -18,6 +18,24 @@ def _create_document():
     return xml.dom.minidom.getDOMImplementation().createDocument(None, None, None)
 
 
+_SUBTITLE_EXTENSIONS = (".srt", ".ass", ".ssa", ".sub", ".vtt")
+
+
+def _has_external_subtitle(out_path: str, file_name: str) -> bool:
+    try:
+        names = os.listdir(out_path)
+    except OSError:
+        return False
+    prefix = str(file_name or "").lower()
+    return any(name.lower().startswith(prefix) and name.lower().endswith(_SUBTITLE_EXTENSIONS) for name in names)
+
+
+def _add_tag_once(doc, root, tag: str) -> None:
+    existing = {str(node.firstChild.nodeValue if node.firstChild else "") for node in root.getElementsByTagName("tag")}
+    if tag not in existing:
+        DomUtils.add_node(doc, root, "tag", tag)
+
+
 class NfoGenerator:
     """NFO 文件生成器 — 负责生成电影/电视剧/季/集的 NFO XML"""
 
@@ -143,6 +161,8 @@ class NfoGenerator:
             for actor in actors:
                 xactor = DomUtils.add_node(doc, root, "actor")
                 DomUtils.add_node(doc, xactor, "name", actor.get("name") or "")
+                for alias in actor.get("aliases") or []:
+                    DomUtils.add_node(doc, xactor, "alias", alias)
                 DomUtils.add_node(doc, xactor, "type", "Actor")
                 DomUtils.add_node(doc, xactor, "role", actor.get("role") or "")
                 DomUtils.add_node(doc, xactor, "order", actor.get("order") if actor.get("order") is not None else "")
@@ -157,18 +177,31 @@ class NfoGenerator:
 
     # ---------- snapshot 渲染（ADR-025） ----------
 
-    def gen_movie_nfo_from_snapshot(self, snapshot, scraper_nfo, out_path, file_name):
+    def gen_movie_nfo_from_snapshot(self, snapshot, scraper_nfo, out_path, file_name, fallback_title: str = ""):
         """从 MediaMetadata 快照生成电影 NFO."""
+        if getattr(snapshot, "content_profile", "") == "adult":
+            # 成人自定义画像必须写标题/简介/演员，不能因用户旧配置只在 NFO 留番号。
+            scraper_nfo = {**scraper_nfo, "basic": True, "credits": True}
         doc = _create_document()
         root = DomUtils.add_node(doc, doc, "movie")
         self._gen_snapshot_common(snapshot, doc, root, scraper_nfo)
         if scraper_nfo.get("basic"):
-            DomUtils.add_node(doc, root, "title", _snapshot_value(snapshot, "title"))
-            DomUtils.add_node(doc, root, "originaltitle", _snapshot_value(snapshot, "original_title"))
+            snapshot_title = _snapshot_value(snapshot, "title")
+            content_code = _snapshot_value(snapshot, "content_id") or file_name
+            title = (
+                fallback_title
+                if fallback_title and snapshot_title.startswith(content_code)
+                else (snapshot_title or fallback_title)
+            )
+            original_title = _snapshot_value(snapshot, "original_title") or title
+            DomUtils.add_node(doc, root, "title", title)
+            DomUtils.add_node(doc, root, "originaltitle", original_title)
             release = _snapshot_value(snapshot, "release_date")
             DomUtils.add_node(doc, root, "premiered", release)
             DomUtils.add_node(doc, root, "year", _snapshot_value(snapshot, "year") or str(release)[:4])
         self._append_fileinfo(doc, root, out_path, file_name)
+        if _has_external_subtitle(out_path, file_name):
+            _add_tag_once(doc, root, "中字")
         self._downloader.save_nfo(doc, os.path.join(out_path, f"{file_name}.nfo"))
 
     def _append_fileinfo(self, doc, root, out_path, file_name):
@@ -344,6 +377,8 @@ class NfoGenerator:
                 elif credit.role == "actor":
                     actor = DomUtils.add_node(doc, root, "actor")
                     DomUtils.add_node(doc, actor, "name", credit.name)
+                    for alias in credit.aliases:
+                        DomUtils.add_node(doc, actor, "alias", alias)
                     DomUtils.add_node(doc, actor, "type", "Actor")
                     DomUtils.add_node(doc, actor, "role", credit.character or "")
                     DomUtils.add_node(doc, actor, "order", credit.order)
@@ -353,9 +388,12 @@ class NfoGenerator:
                         DomUtils.add_node(doc, actor, "thumb", credit.image_url)
                         DomUtils.add_node(doc, actor, "profile", credit.image_url)
             if not snapshot.credits and fallback_actors:
+                actor_aliases = (snapshot.extra or {}).get("actor_aliases") or {}
                 for name in fallback_actors:
                     actor = DomUtils.add_node(doc, root, "actor")
                     DomUtils.add_node(doc, actor, "name", name)
+                    for alias in actor_aliases.get(name) or []:
+                        DomUtils.add_node(doc, actor, "alias", alias)
                     DomUtils.add_node(doc, actor, "type", "Actor")
                     image = actor_images.get(name)
                     if image:

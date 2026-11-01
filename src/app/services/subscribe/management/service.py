@@ -15,7 +15,7 @@ from app.media import MediaInfo
 from app.media.external.bangumi import Bangumi
 from app.services.subscribe.management.add_service import SubscribeAddService
 from app.services.subscribe.management.finish_service import SubscribeFinishService
-from app.services.subscribe.management.query_service import SubscribeQueryService
+from app.services.subscribe.management.query_service import SubscribeQueryService, _normalized_anchor
 from app.services.subscribe.management.refresh_service import SubscribeRefreshService
 from app.services.subscribe.management.update_service import SubscribeUpdateService
 from app.services.subscribe.management.utils import tv_filter_signature
@@ -28,6 +28,14 @@ _ALIAS_MAP_CACHE: dict[str, tuple[float, dict[str, int]]] = {}
 def _norm_title(value) -> str:
     """标题归一化：去空白/常见标点并小写，便于别名比对."""
     return re.sub(r"""[\s~～\-—–:：·・,，.。!！?？'"“”()（）\[\]【】]""", "", str(value or "")).lower()
+
+
+def _parse_season_number(value) -> int:
+    """兼容 SEASON 存 "S02"/"Season 2"/2 等格式."""
+    if isinstance(value, int):
+        return value
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group()) if match else 1
 
 
 class SubscribeService:
@@ -139,7 +147,18 @@ class SubscribeService:
         """媒体是否已入库（用于待转移定稿判定）。"""
         try:
             exist_flag, _, _ = self._downloader.check_exists_medias(meta_info=media, total_ep=total_ep)
-            return bool(exist_flag)
+            if exist_flag:
+                return True
+            # 动画订阅可能落在 tv/anime 任一库；主路径未命中时互换类型再查一次。
+            if media.type in (MediaType.TV, MediaType.ANIME):
+                original = media.type
+                media.type = MediaType.ANIME if original == MediaType.TV else MediaType.TV
+                try:
+                    exist_flag, _, _ = self._downloader.check_exists_medias(meta_info=media, total_ep=total_ep)
+                    return bool(exist_flag)
+                finally:
+                    media.type = original
+            return False
         except Exception as e:  # noqa: BLE001
             log.debug(f"[Subscribe]媒体入库检查失败: {e!s}")
             return False
@@ -190,15 +209,24 @@ class SubscribeService:
         cutoff = now - datetime.timedelta(minutes=max(int(timeout_minutes), 1))
         for tv in self._tv_repo.get_all(state=SubscribeState.COMPLETED.value) or []:
             try:
-                season = int(getattr(tv, "season", 0) or 1)
+                season = _parse_season_number(getattr(tv, "season", 1))
                 total = int(getattr(tv, "total", 0) or 0)
-                media = MediaInfo(type=MediaType.TV, tmdb_id=str(getattr(tv, "tmdb_id", "") or ""))
+                tv_profile = str(getattr(tv, "content_profile", "") or "").strip()
+                tv_mtype = MediaType.ANIME if tv_profile == "anime" else MediaType.TV
+                media = MediaInfo(type=tv_mtype, tmdb_id=str(getattr(tv, "tmdb_id", "") or ""))
                 media.title = getattr(tv, "name", "") or ""
                 media.year = getattr(tv, "year", "") or ""
                 media.begin_season = season
                 media.total_episodes = total
+                tv_provider, tv_external = _normalized_anchor(
+                    getattr(tv, "anchor_provider", ""), getattr(tv, "anchor_external_id", "")
+                )
+                media.content_profile = tv_profile or "default"
+                media.anchor_provider = tv_provider
+                media.anchor_external_id = tv_external
+                media.keyword = getattr(tv, "keyword", None)
                 if self.media_exists(media, total_ep={season: total}):
-                    self.finalize_tv_by_rssid(tv.id, MediaType.TV)
+                    self.finalize_tv_by_rssid(tv.id, tv_mtype)
                 elif self._pending_stale(getattr(tv, "tmdb_id", ""), cutoff):
                     self.update_rss_state(MediaType.TV, tv.id, SubscribeState.RUNNING.value)
                     log.info(f"[Subscribe]待转移超时，重开订阅 rssid={tv.id}（{media.title}）")
@@ -207,8 +235,9 @@ class SubscribeService:
         movies = self._movie_repo.get_all() or []
         pairs: list[tuple[str, str]] = []
         for mv in movies:
-            provider = str(getattr(mv, "anchor_provider", "") or "").strip()
-            external = str(getattr(mv, "anchor_external_id", "") or "").strip()
+            provider, external = _normalized_anchor(
+                getattr(mv, "anchor_provider", ""), getattr(mv, "anchor_external_id", "")
+            )
             if provider and external:
                 pairs.append((provider, external))
         transferred: set[tuple[str, str]] = set()
@@ -222,10 +251,10 @@ class SubscribeService:
                 log.debug(f"[Subscribe]转移历史查询失败: {e!s}")
         for mv in movies:
             try:
-                pair = (
-                    str(getattr(mv, "anchor_provider", "") or "").strip(),
-                    str(getattr(mv, "anchor_external_id", "") or "").strip(),
+                provider, external = _normalized_anchor(
+                    getattr(mv, "anchor_provider", ""), getattr(mv, "anchor_external_id", "")
                 )
+                pair = (provider or "", external or "")
                 # 转移成功即入库：不依赖媒体服务器扫描，历史订阅也能直接定稿。
                 if pair in transferred or (pair[1] and pair[1] in transferred_external):
                     self.finalize_movie_by_rssid(mv.id)
@@ -237,8 +266,8 @@ class SubscribeService:
                 media.title = getattr(mv, "name", "") or ""
                 media.year = getattr(mv, "year", "") or ""
                 media.content_profile = str(getattr(mv, "content_profile", "") or "default")
-                media.anchor_provider = getattr(mv, "anchor_provider", None)
-                media.anchor_external_id = getattr(mv, "anchor_external_id", None)
+                media.anchor_provider = provider
+                media.anchor_external_id = external
                 media.keyword = getattr(mv, "keyword", None)
                 if self.media_exists(media):
                     self.finalize_movie_by_rssid(mv.id)
@@ -246,8 +275,8 @@ class SubscribeService:
                     getattr(mv, "tmdb_id", ""),
                     cutoff,
                     identity_id=getattr(mv, "identity_id", None),
-                    anchor_provider=getattr(mv, "anchor_provider", None),
-                    anchor_external_id=getattr(mv, "anchor_external_id", None),
+                    anchor_provider=provider,
+                    anchor_external_id=external,
                 ):
                     self.update_rss_state(MediaType.MOVIE, mv.id, SubscribeState.RUNNING.value)
                     log.info(f"[Subscribe]待转移超时，重开电影订阅 rssid={mv.id}（{media.title}）")

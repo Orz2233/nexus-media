@@ -13,6 +13,11 @@ import log
 from app.core.settings import settings
 from app.db.repositories.plugin_framework_repo_adapter import PluginConfigRepositoryAdapter, PluginLogRepositoryAdapter
 from app.domain.entities.plugin import PluginConfigEntity
+from app.media.category_contributions import (
+    register_category_contribution,
+    unregister_category_contribution,
+    unregister_plugin_contributions,
+)
 from app.media.display_image_policy import (
     register_display_image_transformer,
     unregister_display_image_transformer,
@@ -63,6 +68,7 @@ class PluginContext:
         self._discovery_service = discovery_service
         self._metadata_cleanups: list[Callable[[], None]] = []
         self._scraper_processors: list[str] = []
+        self._category_contributions: list[str] = []
         self._metadata_visibility = (
             getattr(manifest_metadata, "visibility", "public") if manifest_metadata else "public"
         )
@@ -222,8 +228,20 @@ class PluginContext:
         return False
 
     def remove_schedule(self, job_id: str) -> None:
-        """移除定时任务"""
-        self._scheduler.remove_job(job_id=f"plugin_{self._plugin_id}_{job_id}", jobstore="plugin")
+        """移除基础任务及其派生的 _t*/_1 任务."""
+        base_id = f"plugin_{self._plugin_id}_{job_id}"
+        try:
+            jobs = self._scheduler.get_jobs("plugin")
+        except Exception:  # noqa: BLE001 - 调度器未启动时保持幂等
+            jobs = []
+        removed = False
+        for job in jobs:
+            current = str(getattr(job, "id", ""))
+            if current == base_id or current.startswith(f"{base_id}_"):
+                if self._scheduler.remove_job(job_id=current, jobstore="plugin"):
+                    removed = True
+        if not removed:
+            self._scheduler.remove_job(job_id=base_id, jobstore="plugin")
 
     @property
     def site_engine(self) -> Any:
@@ -330,6 +348,19 @@ class PluginContext:
     def register_naming_profile(self, key: str, profile: Any) -> None:
         self.register_metadata_profile("naming", key, profile)
 
+    def register_category_contribution(self, contribution: Any, persist: Any = None) -> None:
+        """注册插件分类贡献；scope=core 时参与核心分类."""
+        register_category_contribution(contribution, self._plugin_id, persist=persist)
+        namespace = str(contribution.namespace).strip()
+        if namespace not in self._category_contributions:
+            self._category_contributions.append(namespace)
+        self.info(f"分类贡献已注册: {namespace}")
+
+    def unregister_category_contribution(self, namespace: str) -> None:
+        unregister_category_contribution(namespace, self._plugin_id)
+        if namespace in self._category_contributions:
+            self._category_contributions.remove(namespace)
+
     def register_metadata_cleanup(self, cleanup: Callable[[], None]) -> None:
         """注册 provider 缓存/限流清理回调，卸载时自动执行."""
         self._metadata_cleanups.append(cleanup)
@@ -351,6 +382,8 @@ class PluginContext:
             with contextlib.suppress(Exception):
                 cleanup()
         metadata_registry.unregister_plugin(self._plugin_id)
+        unregister_plugin_contributions(self._plugin_id)
+        self._category_contributions.clear()
 
     def _assert_metadata_declared(self, field: str, key: str) -> None:
         manifest = self._metadata_manifest
@@ -393,7 +426,7 @@ class PluginContext:
             self._discovery_service.clear_cache()
 
     def register_message_image_transformer(self, transformer: Callable[[str, str], str]) -> None:
-        """注册通知图片改写器（兼容旧插件）；新插件应使用展示图片转换器."""
+        """注册通知图片改写器；仅影响消息，不改变页面展示图片."""
         register_message_image_transformer(transformer)
 
     def unregister_message_image_transformer(self, transformer: Callable[[str, str], str]) -> None:

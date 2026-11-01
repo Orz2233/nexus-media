@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Callable
 from urllib.parse import quote
 
+import log
 from app.core.exceptions import DomainError, RepositoryError, ServiceError  # noqa: F401
 from app.domain.mediatypes import MediaType
 from app.infrastructure.cache_system import get_cache_manager
@@ -66,6 +67,23 @@ class TransferHistoryService:
                     self._poster_memo[key] = self._poster_resolver(str(history.get("TYPE") or ""), int(tmdbid)) or ""
                 return self._poster_memo[key]
         return ""
+
+    @staticmethod
+    def _build_capabilities(history: dict) -> dict[str, bool]:
+        """由服务端裁剪可用动作，前端只按能力渲染."""
+        source_state = str(history.get("SOURCE_STATE") or "unknown")
+        dest_state = str(history.get("DEST_STATE") or "unknown")
+        has_source = bool(history.get("SOURCE_PATH") and history.get("SOURCE_FILENAME"))
+        has_dest = bool(history.get("DEST_PATH"))
+        source_actionable = has_source and source_state not in ("deleted", "missing")
+        dest_actionable = has_dest and dest_state not in ("deleted", "missing")
+        return {
+            "reidentify": source_actionable,
+            "manual_identify": source_actionable,
+            "delete_record": True,
+            "delete_source": source_actionable,
+            "delete_library": dest_actionable,
+        }
 
     @staticmethod
     def _local_poster(history: dict) -> str:
@@ -154,7 +172,7 @@ class TransferHistoryService:
     def _cache_key(self, prefix: str, *parts) -> str:
         return f"{prefix}:{':'.join(str(p) for p in parts)}"
 
-    def get_transfer_history_page(self, search_str, page, page_num) -> TransferHistoryPageDTO:
+    def get_transfer_history_page(self, search_str, page, page_num, media_type=None) -> TransferHistoryPageDTO:
         """分页查询转移历史（带缓存）"""
         if not page_num:
             page_num = 30
@@ -162,11 +180,11 @@ class TransferHistoryService:
             page = 1
         else:
             page = int(page)
-        cache_key = self._cache_key("history", search_str or "", page, page_num)
+        cache_key = self._cache_key("history", search_str or "", media_type or "", page, page_num)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
-        result = self._filetransfer.get_transfer_history(search_str, page, page_num)
+        result = self._filetransfer.get_transfer_history(search_str, page, page_num, media_type)
         if result is None:
             total_count, historys = 0, []
         else:
@@ -178,10 +196,16 @@ class TransferHistoryService:
             rmt_mode = sync_mode or ""
             history = {k.upper(): v for k, v in history.items()}
             history.update({"SYNC_MODE": sync_mode, "RMT_MODE": rmt_mode})
+            history["SOURCE_STATE"] = history.get("SOURCE_STATE") or "unknown"
+            history["DEST_STATE"] = history.get("DEST_STATE") or "unknown"
+            history["CAPABILITIES"] = self._build_capabilities(history)
             # 海报富化：同 (type, tmdbid) 进程内只解析一次，缺 TMDBID/无解析器则跳过
             history["image"] = ""
             poster = self._resolve_poster(history)
             if poster:
+                if not str(history.get("POSTER") or "").strip():
+                    self._filetransfer.update_transfer_history_poster(history.get("ID"), poster)
+                    history["POSTER"] = poster
                 history["image"] = transform_display_image(
                     str(history.get("CONTENT_PROFILE") or ""),
                     poster,
@@ -246,8 +270,21 @@ class TransferHistoryService:
             "dst_backend": self._filetransfer.get_sync_backend_by_dest(path_to),
         }
 
+    def _prune_missing_unknown(self) -> None:
+        """刷新时清理硬盘上已不存在的未识别记录."""
+        try:
+            records = self._filetransfer.get_transfer_unknown_paths() or []
+            missing = [int(rec.ID) for rec in records if rec.PATH and not os.path.exists(str(rec.PATH))]
+            if missing:
+                self._filetransfer.delete_transfer_unknowns(missing)
+                self._cache.clear()
+                log.info(f"[TransferHistory]清理已不存在的未识别记录: {len(missing)}")
+        except Exception as e:  # noqa: BLE001 - 清理失败不影响列表读取
+            log.warn(f"[TransferHistory]检查未识别文件失败: {e}")
+
     def get_unknown_list(self) -> list[dict]:
         """获取未识别记录列表（带缓存）"""
+        self._prune_missing_unknown()
         cache_key = self._cache_key("unknown_list")
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -262,6 +299,7 @@ class TransferHistoryService:
 
     def get_unknown_list_by_page(self, search_str, page, page_num) -> UnknownListPageDTO:
         """分页查询未识别记录（带缓存）"""
+        self._prune_missing_unknown()
         if not page_num:
             page_num = 30
         if not page:

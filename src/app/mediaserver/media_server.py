@@ -172,7 +172,7 @@ class MediaServer:
             for route in route_repo.list() if routes is None else routes:
                 if not route.enabled or not route.target_path:
                     continue
-                if route.content_profile and route.content_profile != (content_profile or ""):
+                if content_profile and route.content_profile and route.content_profile != content_profile:
                     continue
                 if PathUtils.is_path_in_path(route.target_path, target_path):
                     candidates.append(route)
@@ -286,6 +286,50 @@ class MediaServer:
             return None
         return self.server.get_movies(title, year)
 
+    def list_persons(
+        self,
+        server_id: int | None = None,
+        content_profile: str | None = None,
+        target_path: str | None = None,
+    ) -> list[dict]:
+        """按路由解析实例并列出人物条目。"""
+        resolved = self.resolve_server_id(server_id, content_profile, target_path)
+        client = self._get_client(resolved)
+        if not client or not hasattr(client, "list_persons"):
+            return []
+        return client.list_persons()
+
+    def add_person_tags(
+        self,
+        person_id: str,
+        tags: list[str],
+        server_id: int | None = None,
+        content_profile: str | None = None,
+        target_path: str | None = None,
+    ) -> bool:
+        """按路由解析实例并给人物追加标签。"""
+        resolved = self.resolve_server_id(server_id, content_profile, target_path)
+        client = self._get_client(resolved)
+        if not client or not hasattr(client, "add_person_tags"):
+            return False
+        return client.add_person_tags(person_id, tags)
+
+    def _group_items_by_route(
+        self,
+        items,
+        content_profile: str | None = None,
+    ) -> dict[tuple[int | None, str | None], list[dict]]:
+        grouped: dict[tuple[int | None, str | None], list[dict]] = {}
+        routes = self.route_repo.list() if getattr(self, "route_repo", None) else None
+        for item in items:
+            profile = content_profile or item.get("content_profile")
+            target_path = item.get("target_path") or item.get("file_path")
+            route = self.resolve_route(profile, target_path, routes=routes)
+            target_id = int(route.server_id) if route else self.resolve_server_id()
+            library_id = route.library_id if route else None
+            grouped.setdefault((target_id, library_id), []).append(item)
+        return grouped
+
     def refresh_library_by_items(
         self,
         items,
@@ -297,20 +341,31 @@ class MediaServer:
             return
         if server_id is not None:
             return self._refresh_items_for_instance(items, server_id)
-        grouped: dict[tuple[int | None, str | None], list[dict]] = {}
-        routes = self.route_repo.list() if getattr(self, "route_repo", None) else None
-        for item in items:
-            profile = content_profile or item.get("content_profile")
-            target_path = item.get("target_path") or item.get("file_path")
-            route = self.resolve_route(profile, target_path, routes=routes)
-            target_id = int(route.server_id) if route else self.resolve_server_id()
-            library_id = route.library_id if route else None
-            grouped.setdefault((target_id, library_id), []).append(item)
-        for (target_id, library_id), group_items in grouped.items():
+        for (target_id, library_id), group_items in self._group_items_by_route(items, content_profile).items():
             if library_id:
                 for item in group_items:
                     item.setdefault("library_id", library_id)
             self._refresh_items_for_instance(group_items, target_id)
+
+    def refresh_library_with_scan(
+        self,
+        items,
+        server_id: int | None = None,
+        content_profile: str | None = None,
+    ):
+        """刷新条目后触发路由命中的媒体库扫描，确保新目录也被索引。"""
+        if not items:
+            return
+        if server_id is not None:
+            self._refresh_items_for_instance(items, server_id)
+            self.refresh_root_library(server_id=server_id)
+            return
+        for (target_id, library_id), group_items in self._group_items_by_route(items, content_profile).items():
+            if library_id:
+                for item in group_items:
+                    item.setdefault("library_id", library_id)
+            self._refresh_items_for_instance(group_items, target_id)
+            self.refresh_root_library(server_id=target_id, library_id=library_id)
 
     def _refresh_items_for_instance(self, items, server_id: int | None):
         client = self._get_client(server_id)

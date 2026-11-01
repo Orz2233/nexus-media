@@ -9,7 +9,7 @@ import difflib
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -22,7 +22,9 @@ from app.db.repositories.person_identity_repository import PersonIdentityReposit
 from app.domain.media_ref import MediaSubject
 from app.domain.mediatypes import MediaType
 from app.infrastructure.cache_system import get_cache_manager
+from app.media.display_image_policy import transform_display_image
 from app.media.metadata import (
+    ANCHOR_POLICY,
     DEFAULT_POLICY_KEY,
     FieldValue,
     MediaMetadata,
@@ -43,7 +45,14 @@ from app.media.metadata.registry import registry as global_registry
 
 
 class IdentityRepositoryProtocol(Protocol):
-    def find_by_ref(self, provider: str, external_id: str, *, scope: str = "default") -> Any: ...
+    def find_by_ref(
+        self,
+        provider: str,
+        external_id: str,
+        *,
+        scope: str = "default",
+        media_type: str | None = None,
+    ) -> Any: ...
 
     def latest_snapshot(
         self,
@@ -310,7 +319,12 @@ class MetadataService:
         try:
             matches = []
             for ref in refs:
-                found = self._identity_repo.find_by_ref(ref.provider, ref.external_id, scope=ref.scope)
+                found = self._identity_repo.find_by_ref(
+                    ref.provider,
+                    ref.external_id,
+                    scope=ref.scope,
+                    media_type=ref.media_type.value if ref.media_type else None,
+                )
                 if found is not None and all(item.IDENTITY_ID != found.IDENTITY_ID for item in matches):
                     matches.append(found)
             if matches:
@@ -432,6 +446,9 @@ class MetadataService:
         """
         profile = str(getattr(media_info, "content_profile", "") or "default")
         if profile != "default":
+            return False
+        # 手动转移/订阅已显式给出锚点时，不允许再按系统默认策略改写成 TMDB。
+        if getattr(media_info, "anchor_provider", None) and getattr(media_info, "anchor_external_id", None):
             return False
         policy_key = str(policy or settings.media.metadata_default_policy or "tmdb_primary")
         candidates = sorted(
@@ -641,6 +658,14 @@ class MetadataService:
 
         anchor = anchor_provider or refs[0].provider
         effective_policy = policy
+        # 系统默认 tmdb_primary 不应覆盖明确的非 TMDB 锚点策略；
+        # 否则豆瓣/Bangumi 转移后 NFO 主身份会变成 TMDB。
+        if (
+            anchor in ANCHOR_POLICY
+            and anchor != "tmdb"
+            and effective_policy in (None, "", self.system_default_policy, DEFAULT_POLICY_KEY)
+        ):
+            effective_policy = None
         if refs_override and media_profile != "default":
             effective_policy = f"provider_only:{refs[0].provider}"
         elif (
@@ -680,7 +705,16 @@ class MetadataService:
                     cached_ok = bool(cached_metadata.fields.get("title"))
                     if cached_ok and not cached_metadata.images:
                         cached_ok = not self._refs_support_images(refs)
+                    if (
+                        cached_ok
+                        and media_type in {MediaType.MOVIE, MediaType.TV, MediaType.ANIME}
+                        and self._refs_support_images(refs)
+                        and not (cached_metadata.images or {}).get("poster")
+                    ):
+                        # 只有 fanart/截图时仍视为不完整：海报是媒体库卡片的核心图。
+                        cached_ok = False
                     if cached_ok:
+                        self._attach_source_hints(cached_metadata, media_info)
                         return cached_metadata
                     log.debug("[Metadata]旧快照缺少标题/图片，重新合成")
                 except Exception as exc:  # noqa: BLE001 - 旧快照结构不兼容时重新合成
@@ -699,6 +733,8 @@ class MetadataService:
             locked=locked,
         )
         metadata = result.metadata
+        if metadata is not None:
+            self._attach_source_hints(metadata, media_info)
         if with_episodes and metadata is not None and media_type in {MediaType.TV, MediaType.ANIME}:
             target_seasons = [season] if season else [item.season_number for item in metadata.seasons] or [1]
             for target_season in target_seasons:
@@ -725,6 +761,20 @@ class MetadataService:
             record_degraded()
         return metadata
 
+    @staticmethod
+    def _attach_source_hints(metadata: MediaMetadata, media_info: Any) -> None:
+        """把下载站点携带的标签/描述送入快照，供插件判断版本性质。"""
+        labels = getattr(media_info, "labels", None)
+        if isinstance(labels, str):
+            labels = [item for item in labels.replace("，", ",").replace("|", ",").split(",") if item.strip()]
+        if isinstance(labels, (list, tuple, set)):
+            values = [str(item).strip() for item in labels if str(item).strip()]
+            if values:
+                metadata.extra["source.labels"] = values
+        description = getattr(media_info, "description", None) or getattr(media_info, "org_string", None)
+        if description:
+            metadata.extra["source.description"] = str(description)
+
     def _refs_support_images(self, refs: list[ProviderRef]) -> bool:
         """判断引用中的 provider 是否本应提供图片，用于识别旧空快照."""
         for ref in refs:
@@ -743,7 +793,12 @@ class MetadataService:
         persist: bool,
     ):
         anchor = refs[0]
-        identity = self._identity_repo.find_by_ref(anchor.provider, anchor.external_id, scope=anchor.scope)
+        identity = self._identity_repo.find_by_ref(
+            anchor.provider,
+            anchor.external_id,
+            scope=anchor.scope,
+            media_type=anchor.media_type.value if anchor.media_type else None,
+        )
         if identity is None and persist:
             identity = self._identity_repo.ensure_identity(
                 media_type=media_type.value,
@@ -792,7 +847,12 @@ class MetadataService:
         )
         if tmdb_ref is None:
             return
-        parent = self._identity_repo.find_by_ref("tmdb", tmdb_ref.external_id, scope="default")
+        parent = self._identity_repo.find_by_ref(
+            "tmdb",
+            tmdb_ref.external_id,
+            scope="default",
+            media_type=tmdb_ref.media_type.value if tmdb_ref.media_type else media_type.value,
+        )
         if parent is None:
             parent = self._identity_repo.ensure_identity(
                 media_type=media_type.value,
@@ -1011,7 +1071,12 @@ class MetadataService:
             ref = parse_legacy_ref(str(getattr(media_info, "tmdb_id", "") or ""), media_type)
         if ref is None:
             return None
-        identity = self._identity_repo.find_by_ref(ref.provider, ref.external_id, scope=ref.scope)
+        identity = self._identity_repo.find_by_ref(
+            ref.provider,
+            ref.external_id,
+            scope=ref.scope,
+            media_type=ref.media_type.value if ref.media_type else None,
+        )
         if identity is None:
             profile = str(getattr(media_info, "content_profile", "") or "")
             if profile and profile != "default":
@@ -1052,7 +1117,7 @@ class MetadataService:
         providers = self._registry.list_providers(capability=ProviderCapability.SEARCH)
         if provider:
             providers = [item for item in providers if item.descriptor.provider_key == provider]
-        hits = []
+        selected = []
         for item in providers:
             descriptor = item.descriptor
             if descriptor.visibility == "private":
@@ -1061,6 +1126,10 @@ class MetadataService:
                     permissions is not None and "*" not in permissions and required not in permissions
                 ):
                     continue
+            selected.append(item)
+
+        def search_one(item: Any) -> list[dict[str, Any]]:
+            descriptor = item.descriptor
             runtime = self._orchestrator.runtime_for(descriptor)
             try:
                 runtime.acquire()
@@ -1076,14 +1145,41 @@ class MetadataService:
             except ProviderError as exc:
                 runtime.record_failure()
                 log.warn(f"[Metadata]搜索失败 {descriptor.provider_key}: {exc}")
-                continue
+                return []
             except Exception as exc:  # noqa: BLE001 - 单源搜索失败不影响其他源
                 runtime.record_failure()
                 log.warn(f"[Metadata]搜索失败 {descriptor.provider_key}: {exc}")
-                continue
+                return []
             runtime.record_success()
+            payloads = []
             for hit in results or []:
-                hits.append(hit.model_dump(mode="json"))
+                payload = hit.model_dump(mode="json")
+                if payload.get("poster"):
+                    payload["poster"] = transform_display_image(
+                        str(payload.get("content_profile") or content_profile),
+                        str(payload["poster"]),
+                    )
+                payloads.append(payload)
+            return payloads
+
+        if not selected:
+            return []
+        hits: list[dict[str, Any]] = []
+        executor = ThreadPoolExecutor(max_workers=min(8, len(selected)), thread_name_prefix="metadata_search")
+        futures = {executor.submit(search_one, item): item.descriptor.provider_key for item in selected}
+        # 单 provider 搜索可能包含 Cloudflare 挑战（实测 40~60s），必须等完；
+        # 只有多 provider 聚合才使用短超时，避免慢源拖垮整体。
+        wait_timeout = 120.0 if len(selected) == 1 else 10.0
+        done, not_done = wait(futures, timeout=wait_timeout)
+        for future in done:
+            try:
+                hits.extend(future.result() or [])
+            except Exception as exc:  # noqa: BLE001
+                log.warn(f"[Metadata]搜索任务失败: {exc}")
+        for future in not_done:
+            future.cancel()
+            log.warn(f"[Metadata]搜索超时，忽略 provider: {futures[future]}")
+        executor.shutdown(wait=False, cancel_futures=True)
         hits.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
         return hits[:limit]
 
@@ -1104,7 +1200,11 @@ class MetadataService:
         """按外部锚点合成快照；显式 refs 时保留聚合来源上下文."""
         if refs:
             self._check_visibility(refs, allow_private=allow_private, permissions=permissions)
-        identity = self._identity_repo.find_by_ref(provider, str(external_id))
+        identity = self._identity_repo.find_by_ref(
+            provider,
+            str(external_id),
+            media_type=media_type.value if media_type != MediaType.UNKNOWN else None,
+        )
         tmdb_id = ""
         season = 0
         if identity is not None:
@@ -1263,17 +1363,22 @@ class MetadataService:
         permissions: set[str] | None = None,
     ) -> dict[str, Any] | None:
         self._ensure_builtin()
+        if provider == "tmdb" and media_type is None:
+            # TMDB movie/tv 是两套独立 ID 空间，缺类型不能猜测。
+            log.warn(f"[Metadata]拒绝缺少 media_type 的 TMDB 查询: {external_id}")
+            return None
         ref = ProviderRef(provider=provider, external_id=str(external_id), media_type=media_type, scope=scope)
         self._check_visibility([ref], allow_private=allow_private, permissions=permissions)
         target = self._registry.get_provider(provider)
         if target is None:
             return None
+        type_key = media_type.value if media_type else "auto"
         version = self._detail_cache_version()
-        cache_key = f"v{version}:{provider}:{external_id}:{scope}"
+        cache_key = f"v{version}:{provider}:{external_id}:{scope}:{type_key}"
         cached = self._detail_cache.get(cache_key)
         if isinstance(cached, dict):
             return cached
-        key = f"{provider}:{external_id}:{scope}"
+        key = f"{provider}:{external_id}:{scope}:{type_key}"
         with self._inflight_lock:
             future = self._inflight.get(key)
             owner = future is None

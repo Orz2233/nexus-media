@@ -1,6 +1,6 @@
 """TransferHistoryService 单元测试."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -65,6 +65,35 @@ class TestTransferHistoryService:
         assert result.total_page == 4
         assert result.result[0]["SYNC_MODE"] == "link"
         assert result.result[0]["RMT_MODE"] == "link"
+
+    def test_history_capabilities_are_scoped_by_file_state(self, service, mock_filetransfer):
+        class _DeletedSource:
+            def as_dict(self):
+                return {
+                    "id": 9,
+                    "mode": "link",
+                    "source_path": "/src",
+                    "source_filename": "movie.mkv",
+                    "dest_path": "/dst",
+                    "dest_filename": "movie.mkv",
+                    "source_state": "deleted",
+                    "dest_state": "present",
+                }
+
+        mock_filetransfer.get_transfer_history.return_value = (1, [_DeletedSource()])
+        service._cache.clear()
+        result = service.get_transfer_history_page("", 1, 20)
+
+        item = result.result[0]
+        assert item["SOURCE_STATE"] == "deleted"
+        assert item["DEST_STATE"] == "present"
+        assert item["CAPABILITIES"] == {
+            "reidentify": False,
+            "manual_identify": False,
+            "delete_record": True,
+            "delete_source": False,
+            "delete_library": True,
+        }
 
     def test_history_image_uses_local_poster(self, service, mock_filetransfer, tmp_path):
         """本地 poster 优先；历史展示由前端套用 display 变换，不在这里套消息模糊."""
@@ -266,7 +295,8 @@ class TestTransferHistoryServiceCache:
         first = service.get_unknown_list()
         second = service.get_unknown_list()
         assert first == second
-        mock_filetransfer.get_transfer_unknown_paths.assert_called_once()
+        # 每次刷新都要检查文件存在性，因此会重复读取一次记录。
+        mock_filetransfer.get_transfer_unknown_paths.assert_has_calls([call(), call()])
 
     def test_get_unknown_list_by_page_uses_cache(self, service, mock_filetransfer):
         mock_filetransfer.get_transfer_unknown_paths_by_page.return_value = (1, [_UnknownMock()])
@@ -284,4 +314,4 @@ class TestTransferHistoryServiceCache:
         mock_filetransfer.get_transfer_unknown_paths.return_value = []
         result = service.get_unknown_list()
         assert result == []
-        assert mock_filetransfer.get_transfer_unknown_paths.call_count == 2
+        assert mock_filetransfer.get_transfer_unknown_paths.call_count == 4

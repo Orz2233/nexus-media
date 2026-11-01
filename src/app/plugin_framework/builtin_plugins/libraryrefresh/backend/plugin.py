@@ -84,7 +84,7 @@ class LibraryRefreshPlugin:
             year = media_info.get("year")
             media_name = f"{title} ({year})" if year else title
             self.ctx.info(f"媒体服务器 {mediaserver_type} 刷新媒体 {media_name} ...")
-            self._mediaserver.refresh_library_by_items(
+            self._mediaserver.refresh_library_with_scan(
                 [
                     {
                         "title": title,

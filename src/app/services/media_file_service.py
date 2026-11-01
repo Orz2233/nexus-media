@@ -16,6 +16,8 @@ from app.domain.mediatypes import MediaType
 from app.events import Event
 from app.events.constants import SUBTITLE_DOWNLOAD
 from app.events.payloads import SubtitleDownloadPayload
+from app.media.category_contributions import get_category_tabs, update_category_contribution_by_tab
+from app.media.category_taxonomy import taxonomy_payload
 from app.storage import LocalStorageBackend, StorageBackendFactory
 from app.storage.backends.base import FileInfo, StorageBackend, StorageType
 from app.storage.config_models import LocalStorageConfig
@@ -261,6 +263,13 @@ class MediaFileService:
         self._thread_executor.submit(self._scraper.folder_scraper, path, None, "force_all", dst_backend)
         return "刮削任务已提交，正在后台运行。"
 
+    def download_poster(self, url: str, media_dir: str) -> bool:
+        """从指定 URL 下载海报到媒体目录，供维护任务复用."""
+        if not url or not media_dir:
+            return False
+        self._scraper._init_config()
+        return bool(self._scraper._downloader.download(url, media_dir, "poster", force=True))
+
     def make_dir(self, parent: str, name: str, backend_id: str = "local") -> str:
         """在 parent 下创建目录，返回新目录路径"""
         self._validate_file_name(name)
@@ -321,6 +330,15 @@ class MediaFileService:
         backend.write_stream(target, stream)
         return target
 
+    def get_category_taxonomy(self) -> dict:
+        """获取分类映射词表，供前端规则编辑器使用."""
+
+        return taxonomy_payload()
+
+    def get_category_tabs(self) -> list[dict]:
+        """分类页标签（含插件动态注入标签）."""
+        return get_category_tabs()
+
     def get_category_config(self) -> list[dict]:
         """获取二级分类配置（数据库）"""
         repo = CategoryConfigRepositoryAdapter()
@@ -337,5 +355,12 @@ class MediaFileService:
                 sort_order=item.get("sort_order", 0),
                 is_default=int(item.get("is_default", 0)),
                 rules=item.get("rules", {}),
+                enabled=int(item.get("enabled", 1)),
             )
+        for media_type in {str(item.get("media_type") or "") for item in items}:
+            if media_type not in {"movie", "tv", "anime"}:
+                update_category_contribution_by_tab(
+                    media_type,
+                    [item for item in items if str(item.get("media_type")) == media_type],
+                )
         return "保存成功"

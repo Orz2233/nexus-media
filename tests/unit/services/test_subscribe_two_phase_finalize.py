@@ -57,6 +57,19 @@ def test_finalize_tv_by_rssid_writes_history_deletes_and_notifies():
     message.send_rss_finished_message.assert_called_once()
 
 
+def test_finalize_tv_anime_profile_is_persisted_to_history():
+    tv_repo = MagicMock()
+    row = _row()
+    row.CONTENT_PROFILE = "anime"
+    tv_repo.get_all.side_effect = lambda *a, **k: [row] if k.get("rssid") else []
+    history_repo = MagicMock()
+    svc = SubscribeFinishService(MagicMock(), tv_repo, history_repo, MagicMock(), MagicMock())
+
+    svc.finalize_tv_by_rssid(5, MediaType.TV, MagicMock())
+
+    assert history_repo.upsert.call_args.kwargs["content_profile"] == "anime"
+
+
 def test_finalize_movie_by_rssid_writes_history_deletes():
     movie_repo = MagicMock()
     movie_repo.get_all.return_value = [
@@ -133,6 +146,44 @@ def test_episode_transferred_finalizes_only_when_lack_empty():
     assert finalize.call_args.args[0] == 42
 
 
+def test_episode_transferred_uses_anchor_for_non_tmdb_subscription():
+    tv_repo = MagicMock()
+    tv_repo.get_id_by_anchor.return_value = 77
+    ep_repo = MagicMock()
+    ep_repo.get.return_value = [1]
+    finalize = MagicMock()
+    event = Event(
+        event_type=MEDIA_EPISODE_TRANSFERRED,
+        payload=MediaEpisodeTransferredPayload(
+            tmdb_id="",
+            title="CUSTOM-0001",
+            season="1",
+            episodes=[1],
+            total_episodes=1,
+            anchor_provider="content_id",
+            anchor_external_id="CUSTOM-0001",
+            content_profile="custom",
+            user_id=3,
+        ),
+    )
+    with (
+        patch.object(handlers, "SubscribeTvRepositoryAdapter", return_value=tv_repo),
+        patch.object(handlers, "SubscribeTvEpisodeRepositoryAdapter", return_value=ep_repo),
+    ):
+        handlers.handle_media_episode_transferred(event, finalize_fn=finalize)
+
+    tv_repo.get_id_by_anchor.assert_called_once_with(
+        "content_id",
+        "CUSTOM-0001",
+        season="1",
+        content_profile="custom",
+        user_id=3,
+    )
+    tv_repo.get_id.assert_not_called()
+    finalize.assert_called_once()
+    assert finalize.call_args.args[0] == 77
+
+
 def test_episode_transferred_partial_does_not_finalize():
     tv_repo = MagicMock()
     tv_repo.get_id.return_value = 42
@@ -201,6 +252,49 @@ def test_transfer_fail_reopens_subscription_and_resets_history():
         title=None, year=None, season=None, rssid=9, lack_episodes=[5, 6, 7]
     )
     dha.return_value.update_state.assert_called_once_with("qb", "t1", "downloading")
+
+
+def test_transfer_fail_reopens_tv_subscription_by_anchor():
+    """多元数据 TV 订阅无 TMDB，失败时按锚点回补缺失."""
+    svc = MagicMock()
+    handler = handlers.build_transfer_fail_reopen_handler(svc)
+    history = SimpleNamespace(
+        tmdb_id="",
+        anchor_provider="content_id",
+        anchor_external_id="CUSTOM-0001",
+        season_episode="S01E01",
+        downloader="qb",
+        download_id="t3",
+    )
+    sub = SimpleNamespace(
+        id=12,
+        tmdb_id="",
+        anchor_provider="content_id",
+        anchor_external_id="CUSTOM-0001",
+        season="1",
+        user_id=None,
+    )
+    ep_repo = MagicMock()
+    ep_repo.get.return_value = []
+    event = Event(event_type=TRANSFER_FAIL, payload=TransferFailPayload(path="/dl/x", count=1, reason="boom"))
+
+    with (
+        patch.object(handlers, "DownloadHistoryRepositoryAdapter") as dha,
+        patch.object(handlers, "SubscribeTvRepositoryAdapter") as tha,
+        patch.object(handlers, "SubscribeTvEpisodeRepositoryAdapter", return_value=ep_repo),
+        patch.object(handlers, "SubscribeMovieRepositoryAdapter") as mra,
+        patch.object(handlers, "RegexParser") as rp,
+    ):
+        dha.return_value.get_by_path.return_value = history
+        tha.return_value.get_all.return_value = [sub]
+        mra.return_value.get_all.return_value = []
+        rp.return_value.parse.return_value = SimpleNamespace(season=1, episode=1, end_episode=None)
+        handler(event)
+
+    svc.update_rss_state.assert_called_once_with(MediaType.TV, 12, SubscribeState.RUNNING.value)
+    tha.return_value.update_lack.assert_called_once_with(
+        title=None, year=None, season=None, rssid=12, lack_episodes=[1]
+    )
 
 
 def test_transfer_fail_reopens_movie_subscription():
@@ -456,6 +550,21 @@ def test_reconcile_reopens_stale_pending():
     reopen.assert_called_once_with(MediaType.TV, 5, SubscribeState.RUNNING.value)
 
 
+def test_reconcile_finalizes_anime_tv_with_anime_type():
+    import datetime
+
+    svc, final_tv, _final_mv, reopen = _svc_for_reconcile()
+    tv = SimpleNamespace(id=5, name="T", year="2024", season="1", total=12, tmdb_id="1", content_profile="anime")
+    svc._tv_repo.get_all.return_value = [tv]
+    svc._movie_repo.get_all.return_value = []
+    setattr(svc, "media_exists", MagicMock(return_value=True))
+
+    svc.reconcile_pending_transfers(now=datetime.datetime(2026, 1, 1))
+
+    final_tv.assert_called_once_with(5, MediaType.ANIME)
+    reopen.assert_not_called()
+
+
 def test_reconcile_reopens_stale_movie_pending_by_anchor():
     """无 TMDB 的自定义画像电影待转移超时后按锚点重开."""
     import datetime
@@ -521,7 +630,7 @@ def test_reconcile_finalizes_running_movie_when_transfer_history_exists():
         identity_id="id-21",
         anchor_provider="javdb",
         anchor_external_id="PRWF-017",
-        content_profile="adult",
+        content_profile="custom",
         keyword="PRWF-017",
     )
     svc._tv_repo.get_all.return_value = []
@@ -533,4 +642,52 @@ def test_reconcile_finalizes_running_movie_when_transfer_history_exists():
         svc.reconcile_pending_transfers(now=datetime.datetime(2026, 1, 1))
 
     final_mv.assert_called_once_with(21)
+    reopen.assert_not_called()
+
+
+def test_reconcile_normalizes_content_id_prefixed_anchor():
+    """订阅锚点被写成 tmdb:content_id:XXX 时，也应按外部 ID 命中转移历史."""
+    import datetime
+    from unittest.mock import patch
+
+    svc, _final_tv, final_mv, reopen = _svc_for_reconcile()
+    movie = SimpleNamespace(
+        id=22,
+        name="ABC-123",
+        year="",
+        tmdb_id="",
+        state="C",
+        identity_id="id-22",
+        anchor_provider="tmdb",
+        anchor_external_id="content_id:ABC-123",
+        content_profile="custom",
+        keyword="ABC-123",
+    )
+    svc._tv_repo.get_all.return_value = []
+    svc._movie_repo.get_all.return_value = [movie]
+    transfer_repo = MagicMock()
+    transfer_repo.return_value.get_existing_anchors.return_value = set()
+    transfer_repo.return_value.get_existing_external_ids.return_value = {"ABC-123"}
+
+    with patch("app.services.subscribe.management.service.TransferRepository", transfer_repo):
+        svc.reconcile_pending_transfers(now=datetime.datetime(2026, 1, 1))
+
+    transfer_repo.return_value.get_existing_external_ids.assert_called_once_with(["ABC-123"])
+    final_mv.assert_called_once_with(22)
+    reopen.assert_not_called()
+
+
+def test_reconcile_handles_season_string_prefix():
+    """SEASON 存 "S02" 时不能因 int("S02") 异常跳过定稿."""
+    import datetime
+
+    svc, final_tv, _final_mv, reopen = _svc_for_reconcile()
+    tv = SimpleNamespace(id=43, name="Anime", year="2022", season="S02", total=10, tmdb_id="105248")
+    svc._tv_repo.get_all.return_value = [tv]
+    svc._movie_repo.get_all.return_value = []
+    setattr(svc, "media_exists", MagicMock(return_value=True))
+
+    svc.reconcile_pending_transfers(now=datetime.datetime(2026, 1, 1))
+
+    final_tv.assert_called_once_with(43, MediaType.TV)
     reopen.assert_not_called()

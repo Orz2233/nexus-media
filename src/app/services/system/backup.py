@@ -52,7 +52,7 @@ class BackupRestoreService:
             json_backup = os.path.join(temp_dir, "user_db_export.json")
             sqlite_backup = os.path.join(temp_dir, "user.db")
 
-            target_engine = DatabaseFactory.create_engine()
+            target_engine = DatabaseFactory.create_engine(pool_size=1, max_overflow=0)
 
             if os.path.exists(json_backup):
                 import_from_file(target_engine, json_backup)
@@ -101,13 +101,13 @@ def backup(full_backup=False, bk_path=None):
             shutil.copy(str(config_file), backup_path)
 
         db_type = DatabaseFactory._get_config_db_type()
-        engine = DatabaseFactory.create_engine()
+        engine = DatabaseFactory.create_engine(pool_size=1, max_overflow=0)
         try:
             if db_type == DatabaseFactory.SQLITE:
                 shutil.copy(f"{data_path}/user.db", backup_path)
             export_to_file(engine, str(backup_path / "user_db_export.json"))
         finally:
-            # 备份失败也必须释放连接池，否则每次失败都会叠一层 20+20 槽位的池
+            # 备份失败也必须释放连接池，否则每次失败都会叠一层完整连接池（pool_size + max_overflow 条槽位）
             engine.dispose()
 
         zip_file = str(backup_path) + ".zip"

@@ -192,6 +192,7 @@ def build_services(infra: InfrastructureObjects, facades: BusinessFacades) -> Se
         transfer_pipeline=transfer_pipeline,
         download_history_repo=DownloadHistoryRepositoryAdapter(),
         media_cache=MediaCache(),
+        sync_path_repo=SyncPathRepositoryAdapter(),
     )
 
     shared_client_factory = DownloadClientFactory()
@@ -219,6 +220,7 @@ def build_services(infra: InfrastructureObjects, facades: BusinessFacades) -> Se
         transfer_pipeline=transfer_pipeline,
         download_core=download_core,
         download_monitor=facades.download_monitor,
+        download_history_repo=DownloadHistoryRepositoryAdapter(),
     )
 
     filter_service = FilterService(
@@ -279,13 +281,13 @@ def build_services(infra: InfrastructureObjects, facades: BusinessFacades) -> Se
         event_bus=event_bus,
     )
 
+    # 目录同步使用由连接预算推导的独立线程池，避免共享池放大并发。
     sync_engine = SyncEngine(
         transfer_engine=transfer_engine,
         transfer_pipeline=transfer_pipeline,
         sync_path_repo=SyncPathRepositoryAdapter(),
         storage_backend_repo=StorageBackendRepositoryAdapter(),
-        thread_executor=thread_executor,
-        sync_workers=4,
+        thread_executor=infra.transfer_sync_executor,
     )
 
     sync_service = SyncService(
@@ -295,6 +297,7 @@ def build_services(infra: InfrastructureObjects, facades: BusinessFacades) -> Se
         thread_executor=thread_executor,
         storage_backend_repo=StorageBackendRepositoryAdapter(),
         media_service=media_service,
+        metadata_service=metadata_service,
     )
 
     file_index_service = FileIndexService(sync_path_repo=SyncPathRepositoryAdapter())

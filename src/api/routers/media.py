@@ -10,6 +10,7 @@ from api.deps import (
     get_discovery_service,
     get_downloader_service,
     get_file_index_service,
+    get_filetransfer_service,
     get_media_config_service,
     get_media_file_service,
     get_media_info_service,
@@ -51,6 +52,7 @@ from app.services.media_service import (
 )
 from app.services.metadata_service import MetadataService
 from app.services.search_service import Searcher
+from app.services.transfer.filetransfer_service import FileTransferService
 from app.services.transfer.name_format import FIELD_CATALOG, field_groups, render_path, validate
 from app.utils import StringUtils
 from app.utils.response import fail, success
@@ -232,10 +234,23 @@ class GetTransferHistoryRequest(BaseModel):
     keyword: str | None = None
     page: int | None = None
     pagenum: int | None = None
+    type: str | None = None
 
 
 class GetTransferStatisticsRequest(BaseModel):
     days: int | None = None
+
+
+class HistoryIdsRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+class HistoryFilesDeleteRequest(HistoryIdsRequest):
+    targets: list[str] = Field(default_factory=list)
+
+
+class HistoryFilesCheckRequest(HistoryIdsRequest):
+    targets: list[str] | None = None
 
 
 class GetUnknownListByPageRequest(BaseModel):
@@ -317,6 +332,15 @@ def _record_detail_data(record: dict, media_type: MediaType, status: dict | None
     genres = [str(item) for item in (record.get("genres") or []) if item]
     credits = [item for item in (record.get("credits") or []) if isinstance(item, dict)]
     crews = [{item.get("name"): item.get("character") or "演员"} for item in credits[:12] if item.get("name")]
+    actor_profiles = [
+        {
+            "name": item.get("name"),
+            "aliases": list(item.get("aliases") or []),
+            "image_url": item.get("image_url") or "",
+        }
+        for item in credits[:24]
+        if item.get("name") and str(item.get("role") or "actor") == "actor"
+    ]
     release_date = str(record.get("release_date") or "")
     runtime = record.get("runtime")
     runtime_text = StringUtils.str_timehours(runtime) if isinstance(runtime, int) and runtime else ""
@@ -351,6 +375,7 @@ def _record_detail_data(record: dict, media_type: MediaType, status: dict | None
         "runtime": runtime_text,
         "vote": next(iter((record.get("ratings") or {}).values()), None),
         "crews": crews,
+        "actor_profiles": actor_profiles,
         "fact": facts,
         "seasons": [],
         "links": [],
@@ -796,7 +821,9 @@ def get_transfer_history(
     current_user=Depends(require_any_permission("transfer:view", "library:manage")),
     svc: TransferHistoryService = Depends(get_transfer_history_service),
 ):
-    result = svc.get_transfer_history_page(search_str=req.keyword, page=req.page, page_num=req.pagenum)
+    result = svc.get_transfer_history_page(
+        search_str=req.keyword, page=req.page, page_num=req.pagenum, media_type=req.type
+    )
     return success(
         data={
             "total": result.total,
@@ -816,6 +843,53 @@ def get_transfer_statistics(
 ):
     result = svc.get_transfer_statistics(days=req.days if req.days is not None else 90)
     return success(data=result)
+
+
+@router.post("/history/records/delete", response_model=CommonResponse, summary="删除识别记录（不删除文件）")
+def delete_history_records(
+    req: HistoryIdsRequest,
+    current_user=Depends(require_permission("library:manage")),
+    svc: TransferHistoryService = Depends(get_transfer_history_service),
+    ft: FileTransferService = Depends(get_filetransfer_service),
+):
+    ids = [int(item) for item in req.ids if item is not None]
+    if not ids:
+        return fail(msg="未选择要删除的记录")
+    results = ft.delete_records(ids)
+    svc.invalidate_cache()
+    deleted = sum(1 for item in results if item.get("status") == "deleted")
+    return success(data={"results": results, "deleted": deleted, "total": len(ids)})
+
+
+@router.post("/history/files/delete", response_model=CommonResponse, summary="删除识别记录关联文件（保留记录）")
+def delete_history_files(
+    req: HistoryFilesDeleteRequest,
+    current_user=Depends(require_permission("library:manage")),
+    svc: TransferHistoryService = Depends(get_transfer_history_service),
+    ft: FileTransferService = Depends(get_filetransfer_service),
+):
+    ids = [int(item) for item in req.ids if item is not None]
+    targets = [target for target in req.targets if target in ("source", "library")]
+    if not ids or not targets:
+        return fail(msg="未选择记录或删除目标")
+    results = ft.delete_record_files(ids, targets)
+    svc.invalidate_cache()
+    return success(data={"results": results})
+
+
+@router.post("/history/files/check", response_model=CommonResponse, summary="检测识别记录关联文件状态")
+def check_history_files(
+    req: HistoryFilesCheckRequest,
+    current_user=Depends(require_any_permission("transfer:view", "library:manage")),
+    svc: TransferHistoryService = Depends(get_transfer_history_service),
+    ft: FileTransferService = Depends(get_filetransfer_service),
+):
+    ids = [int(item) for item in req.ids if item is not None]
+    if not ids:
+        return fail(msg="未选择记录")
+    results = ft.check_record_files(ids, req.targets)
+    svc.invalidate_cache()
+    return success(data={"results": results})
 
 
 @router.post("/unknown", response_model=CommonResponse, summary="获取未识别列表")
@@ -1012,6 +1086,15 @@ def media_detail_by_ref(
         for item in credits[:12]
         if item.get("name")
     ]
+    actor_profiles = [
+        {
+            "name": item.get("name"),
+            "aliases": list(item.get("aliases") or []),
+            "image_url": item.get("image_url") or "",
+        }
+        for item in credits[:24]
+        if item.get("name") and str(item.get("role") or "actor") == "actor"
+    ]
     extra = snapshot.get("extra") or {}
     aliases = snapshot.get("aliases") or []
     seasons = []
@@ -1073,26 +1156,16 @@ def media_detail_by_ref(
     external_id = str(record.get("external_id") or req.external_id)
     links = []
     provider_url = metadata_registry.provider_detail_url(provider, external_id, media_type or MediaType.MOVIE)
+    provider_item = metadata_registry.get_provider(provider)
+    provider_desc = getattr(provider_item, "descriptor", None)
     if provider_url:
-        label = {
-            "douban": "豆瓣",
-            "bangumi": "Bangumi",
-            "tmdb": "TMDB",
-        }.get(provider, provider)
+        label = str(getattr(provider_desc, "display_name", "") or provider)
         links.append({"provider": provider, "label": label, "url": provider_url})
-    tmdb_ref = next(
-        (item for item in snapshot.get("refs", []) if item.get("provider") == "tmdb"),
-        None,
+    tmdb_ref = (
+        next((item for item in snapshot.get("refs", []) if item.get("provider") == "tmdb"), None)
+        if provider == "tmdb"
+        else None
     )
-    if tmdb_ref and str(tmdb_ref.get("external_id") or "").isdigit():
-        tmdb_id = str(tmdb_ref["external_id"])
-        links.append(
-            {
-                "provider": "tmdb",
-                "label": "TMDB",
-                "url": f"https://www.themoviedb.org/{'movie' if (media_type == MediaType.MOVIE) else 'tv'}/{tmdb_id}",
-            }
-        )
     status = sub_svc.get_subscribe_by_anchor(
         provider,
         external_id,
@@ -1101,14 +1174,9 @@ def media_detail_by_ref(
     )
     data = {
         "id": external_id,
-        "mediaid": (
-            f"DB:{external_id}"
-            if provider == "douban"
-            else f"BG:{external_id}"
-            if provider == "bangumi"
-            else external_id
-        ),
-        "tmdbid": tmdb_ref.get("external_id", "") if tmdb_ref else "",
+        "mediaid": f"{provider}:{external_id}",
+        "metadata_ref": f"{provider}:{external_id}",
+        "tmdbid": tmdb_ref.get("external_id", "") if provider == "tmdb" and tmdb_ref else "",
         "provider": provider,
         "anchor_provider": provider,
         "anchor_external_id": external_id,
@@ -1126,6 +1194,7 @@ def media_detail_by_ref(
         "runtime": StringUtils.str_timehours(runtime) if runtime else "",
         "vote": rating,
         "crews": crews,
+        "actor_profiles": actor_profiles,
         "fact": facts,
         "seasons": seasons,
         "links": links,
@@ -1401,6 +1470,22 @@ def unidentification(
     return success()
 
 
+@router.get("/category/tabs", response_model=CommonResponse, summary="获取分类页标签")
+def get_category_tabs(
+    current_user=Depends(require_permission("library:manage")),
+    svc: MediaFileService = Depends(get_media_file_service),
+):
+    return success(data=svc.get_category_tabs())
+
+
+@router.get("/category/taxonomy", response_model=CommonResponse, summary="获取分类映射词表")
+def get_category_taxonomy(
+    current_user=Depends(require_permission("library:manage")),
+    svc: MediaFileService = Depends(get_media_file_service),
+):
+    return success(data=svc.get_category_taxonomy())
+
+
 @router.post("/category/config/update", response_model=CommonResponse, summary="更新分类配置")
 def update_category_config(
     req: UpdateCategoryConfigRequest,
@@ -1607,6 +1692,12 @@ class MediaPathUpdateRequest(BaseModel):
     backend: str = "local"
 
 
+class MediaLayoutRequest(BaseModel):
+    movie_layout: str = "category"
+    tv_layout: str = "category"
+    anime_layout: str = "flat"
+
+
 @router.post("/library/path", response_model=CommonResponse, summary="获取媒体库配置")
 def get_media_library_config(
     current_user=Depends(require_any_permission("library:view", "library:manage")),
@@ -1614,6 +1705,17 @@ def get_media_library_config(
 ):
     """获取媒体库路径配置（DB 优先，YAML 回退）"""
     return success(data=svc.get_config())
+
+
+@router.post("/library/layout", response_model=CommonResponse, summary="更新媒体库目录结构")
+def update_media_layout(
+    req: MediaLayoutRequest,
+    current_user=Depends(require_permission("library:manage")),
+    svc: MediaConfigService = Depends(get_media_config_service),
+):
+    """更新电影/电视剧/动漫的目录结构；动漫默认平铺."""
+    svc.set_layouts(req.movie_layout, req.tv_layout, req.anime_layout)
+    return success()
 
 
 @router.post("/library/path/add", response_model=CommonResponse, summary="添加媒体库路径")

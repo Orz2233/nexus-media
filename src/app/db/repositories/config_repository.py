@@ -4,7 +4,9 @@ Handles configuration related database operations.
 Includes: Message Client, Torrent Remove Task, Downloader, User RSS, Filter Rules
 """
 
+import json
 import time
+from typing import Any
 
 from sqlalchemy import Integer, cast, text
 
@@ -916,6 +918,9 @@ class ConfigRepository(BaseRepository):
         tv_backend: str = "",
         anime_backend: str = "",
         unknown_backend: str = "",
+        movie_layout: str = "category",
+        tv_layout: str = "category",
+        anime_layout: str = "flat",
     ) -> None:
         """设置媒体库路径配置（单条记录）"""
         with self.session() as db:
@@ -929,6 +934,9 @@ class ConfigRepository(BaseRepository):
                 existing.TV_BACKEND = tv_backend or existing.TV_BACKEND or ""
                 existing.ANIME_BACKEND = anime_backend or existing.ANIME_BACKEND or ""
                 existing.UNKNOWN_BACKEND = unknown_backend or existing.UNKNOWN_BACKEND or ""
+                existing.MOVIE_LAYOUT = movie_layout
+                existing.TV_LAYOUT = tv_layout
+                existing.ANIME_LAYOUT = anime_layout
             else:
                 config = CONFIGMEDIA(
                     MOVIE_PATH=movie_path or "",
@@ -939,8 +947,27 @@ class ConfigRepository(BaseRepository):
                     TV_BACKEND=tv_backend or "",
                     ANIME_BACKEND=anime_backend or "",
                     UNKNOWN_BACKEND=unknown_backend or "",
+                    MOVIE_LAYOUT=movie_layout,
+                    TV_LAYOUT=tv_layout,
+                    ANIME_LAYOUT=anime_layout,
                 )
                 db.add(config)
+
+    def set_media_layouts(self, movie_layout: str, tv_layout: str, anime_layout: str) -> None:
+        """只更新媒体库目录结构，不动路径和后端配置."""
+        with self.session() as db:
+            existing = db.query(CONFIGMEDIA).first()
+            if existing is None:
+                existing = CONFIGMEDIA(
+                    MOVIE_LAYOUT=movie_layout,
+                    TV_LAYOUT=tv_layout,
+                    ANIME_LAYOUT=anime_layout,
+                )
+                db.add(existing)
+                return
+            existing.MOVIE_LAYOUT = movie_layout
+            existing.TV_LAYOUT = tv_layout
+            existing.ANIME_LAYOUT = anime_layout
 
     # ==================== Category Config ====================
 
@@ -953,7 +980,13 @@ class ConfigRepository(BaseRepository):
             return db.query(CONFIGCATEGORYRULE).all()
 
     def save_category_config(
-        self, media_type: str, name: str, sort_order: int, is_default: int, rules: dict[str, str]
+        self,
+        media_type: str,
+        name: str,
+        sort_order: int,
+        is_default: int,
+        rules: dict[str, str] | list[dict[str, Any]],
+        enabled: int = 1,
     ) -> int:
         with self.session() as db:
             existing = (
@@ -967,16 +1000,36 @@ class ConfigRepository(BaseRepository):
             if existing:
                 existing.SORT_ORDER = sort_order
                 existing.IS_DEFAULT = is_default
+                existing.ENABLED = enabled
                 cid = existing.ID
             else:
-                cat = CONFIGCATEGORY(MEDIA_TYPE=media_type, NAME=name, SORT_ORDER=sort_order, IS_DEFAULT=is_default)
+                cat = CONFIGCATEGORY(
+                    MEDIA_TYPE=media_type,
+                    NAME=name,
+                    SORT_ORDER=sort_order,
+                    IS_DEFAULT=is_default,
+                    ENABLED=enabled,
+                )
                 db.add(cat)
                 db.flush()
                 cid = cat.ID
 
             db.query(CONFIGCATEGORYRULE).filter(CONFIGCATEGORYRULE.CATEGORY_ID == cid).delete()
-            for field, value in rules.items():
-                db.add(CONFIGCATEGORYRULE(CATEGORY_ID=cid, FIELD=field, VALUE=value))
+            if isinstance(rules, list):
+                for rule in rules:
+                    if not isinstance(rule, dict):
+                        continue
+                    db.add(
+                        CONFIGCATEGORYRULE(
+                            CATEGORY_ID=cid,
+                            FIELD=str(rule.get("field") or ""),
+                            VALUE=json.dumps(rule.get("value"), ensure_ascii=False),
+                            RULE_JSON=json.dumps(rule, ensure_ascii=False),
+                        )
+                    )
+            else:
+                for field, value in rules.items():
+                    db.add(CONFIGCATEGORYRULE(CATEGORY_ID=cid, FIELD=field, VALUE=value))
             return int(cid)
 
     def delete_category_config(self, cid: int) -> None:

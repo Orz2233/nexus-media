@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import quote
 
@@ -32,6 +33,7 @@ class _BaseBrowserSession:
         timeout: float = 60.0,
         api_key: str | None = None,
         persist: bool = True,
+        cleanup_auto_tabs: bool = False,
     ):
         self.site_key = site_key
         self.server_url = server_url.rstrip("/")
@@ -44,6 +46,8 @@ class _BaseBrowserSession:
         self._slot: Any = None
         # persist=True 时关闭不删除会话，保留过盾 Cookie 供后续请求复用
         self._persist = persist
+        # 专用后台会话退出时只清理本次自动化产生的 auto_* 临时页。
+        self._cleanup_auto_tabs = cleanup_auto_tabs
         # 会话键可能含 URL（https://...），规范化为 URL 安全 id，避免路径 404
         self.session_id = to_session_id(site_key)
         self._sid = quote(self.session_id, safe="")
@@ -91,6 +95,8 @@ class BrowserSession(_BaseBrowserSession):
 
     def __exit__(self, *exc: Any) -> None:
         try:
+            if getattr(self, "_cleanup_auto_tabs", False):
+                self.close_auto_tabs()
             self.close()
         finally:
             slot = self._slot
@@ -99,30 +105,44 @@ class BrowserSession(_BaseBrowserSession):
                 slot.__exit__(None, None, None)
 
     def _ensure_session(self) -> None:
-        try:
-            self._client.post(f"{self.server_url}/sessions", json=self._ensure_session_payload())
-        except httpx2.HTTPStatusError as e:
-            if e.response.status_code != 409:
-                raise
+        response = self._client.post(f"{self.server_url}/sessions", json=self._ensure_session_payload())
+        # 409 表示会话已存在，服务端通常直接返回 200；其他错误必须立刻暴露。
+        if response.status_code == 409:
+            return
+        response.raise_for_status()
 
     def navigate(
         self,
         url: str,
         *,
+        tab_name: str | None = None,
         cookie: str | None = None,
         referer: str | None = None,
         timeout: int = 30,
+        local_storage: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        payload = {"url": url, "cookie": cookie, "referer": referer, "timeout": timeout}
+        payload = {
+            "url": url,
+            "tab_name": tab_name,
+            "cookie": cookie,
+            "referer": referer,
+            "timeout": timeout,
+            "local_storage": local_storage,
+        }
         response = self._client.post(self._session_url(f"/sessions/{self._sid}/navigate"), json=payload)
         response.raise_for_status()
         return response.json().get("data", {})
 
-    def html(self) -> str:
-        response = self._client.get(self._session_url(f"/sessions/{self._sid}/html"))
+    def html(self, tab_name: str | None = None) -> str:
+        return str(self.current_page(tab_name).get("html") or "")
+
+    def current_page(self, tab_name: str | None = None) -> dict[str, Any]:
+        """读取活动页或指定标签页 URL/HTML，不触发导航."""
+        params = {"tab_name": tab_name} if tab_name else None
+        response = self._client.get(self._session_url(f"/sessions/{self._sid}/html"), params=params)
         response.raise_for_status()
-        data = response.json().get("data", {})
-        return data.get("html", "")
+        data = (response.json() or {}).get("data") or {}
+        return data if isinstance(data, dict) else {}
 
     def cookies(self, domain: str | None = None) -> dict[str, Any]:
         params = {"domain": domain} if domain else {}
@@ -147,8 +167,11 @@ class BrowserSession(_BaseBrowserSession):
         response.raise_for_status()
         return (response.json() or {}).get("data") or {}
 
-    def execute(self, script: str) -> Any:
-        response = self._client.post(self._session_url(f"/sessions/{self._sid}/execute"), json={"script": script})
+    def execute(self, script: str, tab_name: str | None = None) -> Any:
+        payload = {"script": script}
+        if tab_name:
+            payload["tab_name"] = tab_name
+        response = self._client.post(self._session_url(f"/sessions/{self._sid}/execute"), json=payload)
         response.raise_for_status()
         return response.json().get("data", {}).get("result")
 
@@ -158,20 +181,63 @@ class BrowserSession(_BaseBrowserSession):
         response.raise_for_status()
         return response.json().get("data", {})
 
-    def list_tabs(self) -> list[str]:
-        """列出会话内标签页名称."""
+    def list_tabs(self) -> list[dict[str, Any]]:
+        """列出会话内标签页（名称 + URL）."""
+        return list(self.tabs_state().get("tabs") or [])
+
+    def tabs_state(self) -> dict[str, Any]:
+        """返回活动标签页和完整标签页列表."""
         response = self._client.get(self._session_url(f"/sessions/{self._sid}/tabs"))
         response.raise_for_status()
         data = (response.json() or {}).get("data") or {}
-        return list((data.get("tabs") if isinstance(data, dict) else data) or [])
+        return data if isinstance(data, dict) else {"active": None, "tabs": list(data or [])}
+
+    def switch_tab(self, tab_name: str) -> None:
+        response = self._client.post(
+            self._session_url(f"/sessions/{self._sid}/tabs/switch"),
+            json={"name": tab_name},
+        )
+        response.raise_for_status()
+
+    def close_tab(self, tab_name: str) -> None:
+        """关闭指定标签页；404 视为已关闭，其他错误向上抛出."""
+        response = self._client.delete(self._session_url(f"/sessions/{self._sid}/tabs/{quote(str(tab_name), safe='')}"))
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+
+    def close_auto_tabs(self) -> None:
+        """只关闭自动创建的 auto_* 临时页，保留 tab_N 用户页."""
+        try:
+            for tab in self.list_tabs():
+                name = tab.get("name") if isinstance(tab, dict) else str(tab)
+                if name and str(name).startswith("auto_"):
+                    self.close_tab(str(name))
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[BrowserSession] 清理临时标签页失败: {e}")
 
     def close_tabs(self) -> None:
         """关闭会话内全部标签页，保留会话（Cookie/clearance 仍可复用）."""
         try:
-            for name in self.list_tabs():
-                self._client.delete(self._session_url(f"/sessions/{self._sid}/tabs/{quote(str(name), safe='')}"))
+            for tab in self.list_tabs():
+                name = tab.get("name") if isinstance(tab, dict) else str(tab)
+                if name:
+                    self.close_tab(str(name))
         except Exception as e:  # noqa: BLE001
-            log.debug(f"[BrowserSession] 关闭标签页失败: {e}")
+            log.warn(f"[BrowserSession] 关闭标签页失败: {e}")
+
+    def close_inactive_tabs(self) -> None:
+        """保留活动标签页，只关闭历史标签，避免会话内标签累计."""
+        try:
+            state = self.tabs_state()
+            active = state.get("active")
+            tabs = state.get("tabs") or []
+            for tab in tabs:
+                name = tab.get("name") if isinstance(tab, dict) else str(tab)
+                if name and name != active:
+                    self.close_tab(str(name))
+        except Exception as e:  # noqa: BLE001
+            log.warn(f"[BrowserSession] 清理非活动标签页失败: {e}")
 
     def screenshot(self, tab_name: str | None = None, full_page: bool = False) -> dict[str, Any]:
         """对指定（或活动）标签页截图，返回 {png_base64, size, ...}"""
@@ -181,16 +247,17 @@ class BrowserSession(_BaseBrowserSession):
         return response.json().get("data", {})
 
     def close(self, delete_session: bool | None = None) -> None:
+        if getattr(self, "_cleanup_auto_tabs", False):
+            self.close_auto_tabs()
         if delete_session is None:
             delete_session = not self._persist
         if delete_session:
             try:
-                self._client.delete(self._session_url(f"/sessions/{self._sid}"))
+                response = self._client.delete(self._session_url(f"/sessions/{self._sid}"))
+                if response.status_code not in (200, 404):
+                    response.raise_for_status()
             except Exception as e:
                 log.warn(f"[BrowserSession] 关闭会话 {self.session_id} 失败: {e}")
-        else:
-            # 持久会话保留 Cookie/clearance，但必须释放标签页，避免浏览器卡死。
-            self.close_tabs()
         self._client.close()
 
 
@@ -202,37 +269,64 @@ class AsyncBrowserSession(_BaseBrowserSession):
         self._client = httpx2.AsyncClient(timeout=self.timeout, follow_redirects=True, headers=self._auth_headers())
 
     async def __aenter__(self) -> AsyncBrowserSession:
-        await self._ensure_session()
+        self._slot = browser_slot()
+        await asyncio.to_thread(self._slot.__enter__)
+        try:
+            await self._ensure_session()
+        except Exception:
+            slot = self._slot
+            self._slot = None
+            if slot is not None:
+                await asyncio.to_thread(slot.__exit__, None, None, None)
+            raise
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        await self.close()
+        try:
+            await self.close()
+        finally:
+            slot = self._slot
+            self._slot = None
+            if slot is not None:
+                await asyncio.to_thread(slot.__exit__, None, None, None)
 
     async def _ensure_session(self) -> None:
-        try:
-            await self._client.post(f"{self.server_url}/sessions", json=self._ensure_session_payload())
-        except httpx2.HTTPStatusError as e:
-            if e.response.status_code != 409:
-                raise
+        response = await self._client.post(f"{self.server_url}/sessions", json=self._ensure_session_payload())
+        if response.status_code == 409:
+            return
+        response.raise_for_status()
 
     async def navigate(
         self,
         url: str,
         *,
+        tab_name: str | None = None,
         cookie: str | None = None,
         referer: str | None = None,
         timeout: int = 30,
+        local_storage: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        payload = {"url": url, "cookie": cookie, "referer": referer, "timeout": timeout}
+        payload = {
+            "url": url,
+            "tab_name": tab_name,
+            "cookie": cookie,
+            "referer": referer,
+            "timeout": timeout,
+            "local_storage": local_storage,
+        }
         response = await self._client.post(self._session_url(f"/sessions/{self._sid}/navigate"), json=payload)
         response.raise_for_status()
         return response.json().get("data", {})
 
-    async def html(self) -> str:
-        response = await self._client.get(self._session_url(f"/sessions/{self._sid}/html"))
+    async def html(self, tab_name: str | None = None) -> str:
+        return str((await self.current_page(tab_name)).get("html") or "")
+
+    async def current_page(self, tab_name: str | None = None) -> dict[str, Any]:
+        params = {"tab_name": tab_name} if tab_name else None
+        response = await self._client.get(self._session_url(f"/sessions/{self._sid}/html"), params=params)
         response.raise_for_status()
         data = response.json().get("data", {})
-        return data.get("html", "")
+        return data if isinstance(data, dict) else {}
 
     async def cookies(self, domain: str | None = None) -> dict[str, Any]:
         params = {"domain": domain} if domain else {}
@@ -253,10 +347,21 @@ class AsyncBrowserSession(_BaseBrowserSession):
         )
         response.raise_for_status()
 
-    async def execute(self, script: str) -> Any:
-        response = await self._client.post(self._session_url(f"/sessions/{self._sid}/execute"), json={"script": script})
+    async def execute(self, script: str, tab_name: str | None = None) -> Any:
+        payload = {"script": script}
+        if tab_name:
+            payload["tab_name"] = tab_name
+        response = await self._client.post(self._session_url(f"/sessions/{self._sid}/execute"), json=payload)
         response.raise_for_status()
         return response.json().get("data", {}).get("result")
+
+    async def turnstile(self, timeout: int = 25) -> dict[str, Any]:
+        response = await self._client.post(
+            self._session_url(f"/sessions/{self._sid}/turnstile"),
+            params={"timeout": timeout},
+        )
+        response.raise_for_status()
+        return (response.json() or {}).get("data") or {}
 
     async def fetch(self, url: str, method: str = "GET", **kwargs: Any) -> dict[str, Any]:
         payload = {"url": url, "method": method, **kwargs}
@@ -271,27 +376,59 @@ class AsyncBrowserSession(_BaseBrowserSession):
         response.raise_for_status()
         return response.json().get("data", {})
 
-    async def list_tabs(self) -> list[str]:
+    async def list_tabs(self) -> list[dict[str, Any]]:
+        return list((await self.tabs_state()).get("tabs") or [])
+
+    async def tabs_state(self) -> dict[str, Any]:
         response = await self._client.get(self._session_url(f"/sessions/{self._sid}/tabs"))
         response.raise_for_status()
         data = (response.json() or {}).get("data") or {}
-        return list((data.get("tabs") if isinstance(data, dict) else data) or [])
+        return data if isinstance(data, dict) else {"active": None, "tabs": list(data or [])}
+
+    async def switch_tab(self, tab_name: str) -> None:
+        response = await self._client.post(
+            self._session_url(f"/sessions/{self._sid}/tabs/switch"),
+            json={"name": tab_name},
+        )
+        response.raise_for_status()
+
+    async def close_tab(self, tab_name: str) -> None:
+        response = await self._client.delete(
+            self._session_url(f"/sessions/{self._sid}/tabs/{quote(str(tab_name), safe='')}")
+        )
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
 
     async def close_tabs(self) -> None:
         try:
-            for name in await self.list_tabs():
-                await self._client.delete(self._session_url(f"/sessions/{self._sid}/tabs/{quote(str(name), safe='')}"))
+            for tab in await self.list_tabs():
+                name = tab.get("name") if isinstance(tab, dict) else str(tab)
+                if name:
+                    await self.close_tab(str(name))
         except Exception as e:  # noqa: BLE001
-            log.debug(f"[AsyncBrowserSession] 关闭标签页失败: {e}")
+            log.warn(f"[AsyncBrowserSession] 关闭标签页失败: {e}")
+
+    async def close_inactive_tabs(self) -> None:
+        """保留活动标签页，只关闭历史标签."""
+        try:
+            state = await self.tabs_state()
+            active = state.get("active")
+            for tab in state.get("tabs") or []:
+                name = tab.get("name") if isinstance(tab, dict) else str(tab)
+                if name and name != active:
+                    await self.close_tab(str(name))
+        except Exception as e:  # noqa: BLE001
+            log.warn(f"[AsyncBrowserSession] 清理非活动标签页失败: {e}")
 
     async def close(self, delete_session: bool | None = None) -> None:
         if delete_session is None:
             delete_session = not self._persist
         if delete_session:
             try:
-                await self._client.delete(self._session_url(f"/sessions/{self._sid}"))
+                response = await self._client.delete(self._session_url(f"/sessions/{self._sid}"))
+                if response.status_code not in (200, 404):
+                    response.raise_for_status()
             except Exception as e:
                 log.warn(f"[AsyncBrowserSession] 关闭会话 {self.session_id} 失败: {e}")
-        else:
-            await self.close_tabs()
         await self._client.aclose()

@@ -15,18 +15,25 @@ from app.services.transfer.filetransfer_service import FileTransferService
 def _svc(exists: bool, tmp_path, dest_filename="E05.mkv"):
     src = tmp_path / "src.mkv"
     src.write_bytes(b"x")
+    dest_root = tmp_path / "lib"
+    if exists:
+        nested = dest_root / "Show" / "Season 1"
+        nested.mkdir(parents=True)
+        (nested / dest_filename).write_bytes(b"y")
     svc = FileTransferService.__new__(FileTransferService)
     svc._history = MagicMock()
     svc._existence = MagicMock()
-    svc._history.get_transfer_info_by.return_value = [
+    history = [
         SimpleNamespace(
             source_path=str(src),
-            season_episode="S01E05",
-            dest_path=str(tmp_path / "lib"),
+            season_episode="S01 E05",
+            dest_path=str(dest_root),
             dest_filename=dest_filename,
             dst_backend=None,
         )
     ]
+    svc._history.get_transfer_info_by.return_value = history
+    svc._history.get_transfer_info_by_ref.return_value = history
     svc._existence.exists.return_value = exists
     svc._existence.get_no_exists_medias.return_value = [1, 2, 3]
     return svc
@@ -71,7 +78,7 @@ def _svc_for_dedup(tmp_path, dest_exists: bool):
         dest_exists,
         str(dest_file),
     )
-    svc._history.get_transfer_info_by.return_value = [
+    history = [
         SimpleNamespace(
             source_path=str(src_dir),
             season_episode="S01E01",
@@ -79,6 +86,8 @@ def _svc_for_dedup(tmp_path, dest_exists: bool):
             dest_filename="E01.mkv",
         )
     ]
+    svc._history.get_transfer_info_by.return_value = history
+    svc._history.get_transfer_info_by_ref.return_value = history
     svc._engine = MagicMock()
     svc._replicate_to_enabled_backends = MagicMock()
     return svc, file_item

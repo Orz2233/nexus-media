@@ -10,10 +10,11 @@ from app.db.repositories.category_repo_adapter import CategoryConfigRepositoryAd
 from app.domain.media_ref import MediaRef
 from app.domain.mediatypes import MediaType
 from app.infrastructure.image_proxy import ImageProxy
-from app.media.category_matcher import get_category
-from app.media.display_image_policy import transform_display_image
 from app.media.image_resolver import MediaImageResolver
+from app.media.message_image_policy import transform_message_image
 from app.utils import StringUtils
+
+from .category_matcher import get_category
 
 
 class MediaInfo(BaseModel):
@@ -37,6 +38,7 @@ class MediaInfo(BaseModel):
     # ---- 名称 ----
     cn_name: str | None = None
     en_name: str | None = None
+    aliases: list[str] = Field(default_factory=list)
     _name: str | None = None
 
     # ---- 解析器内部属性 ----
@@ -476,10 +478,10 @@ class MediaInfo(BaseModel):
             return
         adapter = CategoryConfigRepositoryAdapter()
         entities = adapter.get_all()
-        rule_map: dict[str, dict[str, dict[str, str]]] = {"movie": {}, "tv": {}, "anime": {}}
+        rule_map: dict[str, dict[str, Any]] = {"movie": {}, "tv": {}, "anime": {}}
         for ent in entities:
             mt = ent.media_type
-            if mt in rule_map:
+            if mt in rule_map and bool(getattr(ent, "enabled", True)):
                 effective = ent.rules if not ent.is_default else {}
                 if not effective:
                     log.debug(f"[MediaInfo]分类『{ent.name}』({mt}) 无有效规则，将作为兜底")
@@ -492,17 +494,21 @@ class MediaInfo(BaseModel):
             if parsed_media_type != MediaType.UNKNOWN:
                 media_type = parsed_media_type
         raw_genres = info.get("genres") or []
-        self.genres = [
-            str(genre.get("name") or genre.get("id"))
-            for genre in raw_genres
-            if (hasattr(genre, "get") and (genre.get("name") or genre.get("id")))
-            or (not hasattr(genre, "get") and genre)
-        ]
+        # TMDB 返回 [{"id","name"}]，多元数据 provider 常返回 ["动画", ...]。
+        self.genres = []
+        for genre in raw_genres:
+            value = genre.get("name") or genre.get("id") if hasattr(genre, "get") else genre
+            if value not in (None, ""):
+                self.genres.append(str(value))
         if media_type == MediaType.TV:
             genre_ids = info.get("genre_ids") or []
             # TMDB detail 返回 genres（数组）而非 genre_ids，需兼容提取
             if not genre_ids:
-                genre_ids = [g.get("id") for g in (info.get("genres") or []) if g.get("id")]
+                genre_ids = [
+                    g.get("id")
+                    for g in (info.get("genres") or [])
+                    if hasattr(g, "get") and g.get("id")
+                ]
             if isinstance(genre_ids, list):
                 genre_ids = [str(val).upper() for val in genre_ids]
             else:
@@ -564,7 +570,7 @@ class MediaInfo(BaseModel):
                         break
             if self.release_date:
                 self.year = self.release_date[0:4]
-            self.category = get_category(rule_map.get("movie"), info)
+            self.category = get_category(rule_map.get("movie"), info, MediaType.MOVIE.value)
             log.debug(
                 f"[MediaInfo]电影分类匹配: title={self.title!r} lang={info.get('original_language')} "
                 f"origin={info.get('origin_country')} genre={info.get('genre_ids')} -> {self.category!r}"
@@ -601,15 +607,15 @@ class MediaInfo(BaseModel):
             if self.release_date:
                 self.year = self.release_date[0:4]
             if self.type == MediaType.MOVIE:
-                self.category = get_category(rule_map.get("movie"), info)
+                self.category = get_category(rule_map.get("movie"), info, MediaType.MOVIE.value)
                 log.debug(
                     f"[MediaInfo]电影分类匹配: title={self.title!r} lang={info.get('original_language')} "
                     f"origin={info.get('origin_country')} genre={info.get('genre_ids')} -> {self.category!r}"
                 )
             elif self.type == MediaType.TV:
-                self.category = get_category(rule_map.get("tv"), info)
+                self.category = get_category(rule_map.get("tv"), info, MediaType.TV.value)
             else:
-                self.category = get_category(rule_map.get("anime"), info)
+                self.category = get_category(rule_map.get("anime"), info, MediaType.ANIME.value)
             self.poster_path = (
                 ImageProxy.get_tmdbimage_url(info.get("poster_path"), size="medium") if info.get("poster_path") else ""
             )
@@ -692,7 +698,15 @@ class MediaInfo(BaseModel):
 
     def get_message_image(self):
         image = MediaImageResolver.get_message_image(self)
-        return transform_display_image(
+        return transform_message_image(
+            str(getattr(self, "content_profile", "") or ""),
+            str(image or ""),
+        )
+
+    def get_message_poster_image(self, original=False):
+        """通知里的副图也走消息策略，不能复用页面海报转换结果."""
+        image = MediaImageResolver.get_poster_image(self, original=original)
+        return transform_message_image(
             str(getattr(self, "content_profile", "") or ""),
             str(image or ""),
         )

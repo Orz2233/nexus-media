@@ -82,6 +82,12 @@ class SearchQueryBuilder:
 
         search_name_list.append(search_cn_name)
         search_name_list.append(search_en_name)
+        for alias in getattr(media_info, "aliases", None) or []:
+            alias_text = str(alias or "").strip()
+            if alias_text and alias_text not in search_name_list:
+                search_name_list.append(alias_text)
+                if len(search_name_list) >= 6:
+                    break
 
         # 开启多语言搜索
         max_workers = 1
@@ -247,8 +253,25 @@ class SearchResultProcessor:
 
         return sorted(media_list, key=_sort_key, reverse=True)
 
-    def filter_downloaded(self, media_list: list) -> list:
-        """过滤掉已完成下载历史中存在的资源（失败/进行中的任务不阻塞）"""
+    def filter_downloaded(self, media_list: list, force: bool = False) -> list:
+        """过滤已完成下载历史；手动刷新仅在无活动任务时允许重新下载."""
+        if force and media_list:
+            media_item = media_list[0]
+            ref = media_item.get_media_ref()
+            if ref is not None and ref.provider != "tmdb":
+                get_rows = getattr(self._download_repo, "get_by_identity", None)
+                rows = (
+                    get_rows(
+                        identity_id=getattr(media_item, "identity_id", None),
+                        anchor_provider=ref.provider,
+                        anchor_external_id=ref.external_id,
+                    )
+                    if get_rows
+                    else []
+                )
+                active = {"downloading", "pending", "running", "paused", "queued"}
+                if not any(str(getattr(row, "state", "") or "").lower() in active for row in rows or []):
+                    return list(media_list)
         filtered = []
         for media_item in media_list:
             ref = media_item.get_media_ref()
@@ -360,6 +383,7 @@ class Searcher:
         filters: dict | None = None,
         user_name=None,
         user_id: int | str | None = None,
+        force_download: bool = False,
     ) -> tuple[Any, dict, int, int]:
         """
         只搜索和下载一个资源
@@ -443,7 +467,7 @@ class Searcher:
                 return None, no_exists, len(media_list), 0
 
         # 4. 过滤已下载
-        filtered_media_list = processor.filter_downloaded(media_list)
+        filtered_media_list = processor.filter_downloaded(media_list, force=force_download)
         if not filtered_media_list:
             log.info("[Searcher]所有搜索结果已在下载历史中存在，跳过下载")
             return None, no_exists, len(media_list), 0
@@ -519,6 +543,7 @@ class SearchService:
         filters: dict | None = None,
         user_name: str | None = None,
         user_id: int | str | None = None,
+        force_download: bool = False,
     ) -> SearchOneMediaResultDTO:
         result = self._searcher.search_one_media(
             media_info=media_info,
@@ -528,6 +553,7 @@ class SearchService:
             filters=filters or {},
             user_name=user_name,
             user_id=user_id,
+            force_download=force_download,
         )
         if not result:
             return SearchOneMediaResultDTO()
